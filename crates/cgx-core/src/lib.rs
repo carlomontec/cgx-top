@@ -6,7 +6,10 @@ pub mod parser;
 
 pub use model::*;
 pub use invariants::*;
-pub use parser::{parse_frd_file, FrdParserEngine};
+pub use parser::{
+    consolidate_inp, inspect_inp, load_companion_sets, parse_frd_file, parse_sets_from_inp,
+    parse_sets_from_str, ByteCursor, FrdParserEngine, InpConsolidateStats, InpInclude, InpSummary,
+};
 
 use thiserror::Error;
 

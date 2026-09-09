@@ -5,7 +5,7 @@ use crate::{
     StepInfo,
 };
 use super::reader::ByteCursor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Helper to check if a byte slice is empty or only whitespace
 #[inline]
@@ -42,6 +42,25 @@ fn slice_safe(line: &[u8], start: usize, end: usize) -> &[u8] {
     } else {
         let actual_end = end.min(len);
         &line[start..actual_end]
+    }
+}
+
+/// Generate default component names when -5 record is omitted in FRD
+fn default_component_names(field: &str, ncomps: usize) -> Vec<String> {
+    let upper = field.to_uppercase();
+    if upper == "DISP" {
+        if ncomps == 4 {
+            vec!["D1".into(), "D2".into(), "D3".into(), "ALL".into()]
+        } else {
+            vec!["D1".into(), "D2".into(), "D3".into()]
+        }
+    } else if upper == "STRESS" {
+        vec![
+            "SXX".into(), "SYY".into(), "SZZ".into(),
+            "SXY".into(), "SYZ".into(), "SZX".into(),
+        ]
+    } else {
+        (1..=ncomps.max(1)).map(|i| format!("C{}", i)).collect()
     }
 }
 
@@ -98,6 +117,7 @@ impl<'a> FrdParserEngine<'a> {
             }
         }
 
+        model.populate_implicit_sets();
         Ok(model)
     }
 
@@ -322,7 +342,8 @@ impl<'a> FrdParserEngine<'a> {
         };
 
         let mut field_name = String::new();
-        let mut component_names: Vec<String> = Vec::new();
+        let mut components_meta: Vec<(String, i32)> = Vec::new(); // (comp_name, iexist)
+        let mut ncomps: usize = 0;
 
         // Read metadata lines (-4 and -5)
         while let Some(line) = self.cursor.read_line() {
@@ -332,16 +353,25 @@ impl<'a> FrdParserEngine<'a> {
             if line.starts_with(b" -4") || line.starts_with(b"-4") {
                 let name_bytes = slice_safe(line, 4, 12);
                 field_name = std::str::from_utf8(name_bytes).unwrap_or("").trim().to_string();
+                ncomps = parse_int(slice_safe(line, 12, 17)).unwrap_or(0);
             } else if line.starts_with(b" -5") || line.starts_with(b"-5") {
                 let comp_bytes = slice_safe(line, 4, 12);
                 let comp_name = std::str::from_utf8(comp_bytes).unwrap_or("").trim().to_string();
+                let iexist = parse_int(slice_safe(line, 33, 38)).unwrap_or(0);
                 if !comp_name.is_empty() {
-                    component_names.push(comp_name);
+                    components_meta.push((comp_name, iexist));
                 }
             } else if line.starts_with(b" -1") || line.starts_with(b"-1") {
                 // If ASCII format, we've encountered the first data line.
                 // We'll process it and subsequent ASCII lines.
-                return self.parse_ascii_dataset_payload(header_line, field_name, component_names, line, step_number, value, format_flag);
+                if components_meta.is_empty() {
+                    let def_names = default_component_names(&field_name, ncomps);
+                    components_meta = def_names.into_iter().map(|n| {
+                        let iexist = if n.eq_ignore_ascii_case("ALL") { 1 } else { 0 };
+                        (n, iexist)
+                    }).collect();
+                }
+                return self.parse_ascii_dataset_payload(header_line, field_name, components_meta, line, step_number, value, format_flag);
             } else {
                 // In binary format, data begins directly after the last -5 record without a leading -1 text marker!
                 // Rewind cursor back by length of line + 1 (newline)
@@ -351,8 +381,16 @@ impl<'a> FrdParserEngine<'a> {
             }
         }
 
+        if components_meta.is_empty() {
+            let def_names = default_component_names(&field_name, ncomps);
+            components_meta = def_names.into_iter().map(|n| {
+                let iexist = if n.eq_ignore_ascii_case("ALL") { 1 } else { 0 };
+                (n, iexist)
+            }).collect();
+        }
+
         // Process binary dataset payload
-        self.parse_binary_dataset_payload(field_name, component_names, nod_data, step_number, value, format_flag)
+        self.parse_binary_dataset_payload(field_name, components_meta, nod_data, step_number, value, format_flag)
     }
 
     /// Process ASCII dataset lines
@@ -360,15 +398,15 @@ impl<'a> FrdParserEngine<'a> {
         &mut self,
         _header_line: &[u8],
         field_name: String,
-        component_names: Vec<String>,
+        components_meta: Vec<(String, i32)>,
         first_line: &[u8],
         step_number: u32,
         value: f32,
         format_flag: usize,
     ) -> Result<Dataset> {
-        let mut components: Vec<ComponentData> = component_names
+        let mut components: Vec<ComponentData> = components_meta
             .iter()
-            .map(|cname| ComponentData {
+            .map(|(cname, _)| ComponentData {
                 name: cname.clone(),
                 min_val: f32::MAX,
                 min_node: 0,
@@ -376,6 +414,12 @@ impl<'a> FrdParserEngine<'a> {
                 max_node: 0,
                 values: HashMap::new(),
             })
+            .collect();
+
+        let payload_indices: Vec<usize> = components_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, (_, iexist))| if *iexist != 1 { Some(idx) } else { None })
             .collect();
 
         let col_offset = if format_flag == 0 { 8 } else { 13 };
@@ -388,19 +432,20 @@ impl<'a> FrdParserEngine<'a> {
                     parse_int(slice_safe(line, 3, 13)).unwrap_or(0)
                 };
 
-                let max_primary = components.len().min(6);
-                for i in 0..max_primary {
-                    let start = col_offset + i * 12;
-                    let end = start + 12;
-                    if let Some(val) = parse_float(slice_safe(line, start, end)) {
-                        components[i].values.insert(node_id, val);
-                        if val < components[i].min_val {
-                            components[i].min_val = val;
-                            components[i].min_node = node_id;
-                        }
-                        if val > components[i].max_val {
-                            components[i].max_val = val;
-                            components[i].max_node = node_id;
+                for (val_idx, &comp_idx) in payload_indices.iter().enumerate() {
+                    if val_idx < 6 {
+                        let start = col_offset + val_idx * 12;
+                        let end = start + 12;
+                        if let Some(val) = parse_float(slice_safe(line, start, end)) {
+                            components[comp_idx].values.insert(node_id, val);
+                            if val < components[comp_idx].min_val {
+                                components[comp_idx].min_val = val;
+                                components[comp_idx].min_node = node_id;
+                            }
+                            if val > components[comp_idx].max_val {
+                                components[comp_idx].max_val = val;
+                                components[comp_idx].max_node = node_id;
+                            }
                         }
                     }
                 }
@@ -420,6 +465,9 @@ impl<'a> FrdParserEngine<'a> {
                 process_line(line, true);
             }
         }
+
+        // Post-process derived components (e.g. ALL magnitude)
+        Self::derive_magnitude_components(&field_name, &mut components);
 
         let field_type = match field_name.to_uppercase().as_str() {
             "DISP" => FieldType::Displacement,
@@ -443,16 +491,15 @@ impl<'a> FrdParserEngine<'a> {
     fn parse_binary_dataset_payload(
         &mut self,
         field_name: String,
-        component_names: Vec<String>,
+        components_meta: Vec<(String, i32)>,
         nod_data: usize,
         step_number: u32,
         value: f32,
         format_flag: usize,
     ) -> Result<Dataset> {
-        let ncomps = component_names.len();
-        let mut components: Vec<ComponentData> = component_names
+        let mut components: Vec<ComponentData> = components_meta
             .iter()
-            .map(|cname| ComponentData {
+            .map(|(cname, _)| ComponentData {
                 name: cname.clone(),
                 min_val: f32::MAX,
                 min_node: 0,
@@ -462,9 +509,17 @@ impl<'a> FrdParserEngine<'a> {
             })
             .collect();
 
+        // Indices of components actually present in the binary payload (iexist != 1)
+        let payload_indices: Vec<usize> = components_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, (_, iexist))| if *iexist != 1 { Some(idx) } else { None })
+            .collect();
+        let nvals = payload_indices.len();
+
         if format_flag == 2 {
-            // Float32: 4 bytes node_id + ncomps * 4 bytes float values
-            let bytes_per_record = 4 + ncomps * 4;
+            // Float32: 4 bytes node_id + nvals * 4 bytes float values
+            let bytes_per_record = 4 + nvals * 4;
             let total_bytes = nod_data * bytes_per_record;
             let raw = self.cursor.read_exact(total_bytes).ok_or_else(|| {
                 FrdError::InvalidFormat(format!("Unexpected EOF reading binary float dataset {}", field_name))
@@ -472,24 +527,24 @@ impl<'a> FrdParserEngine<'a> {
 
             for chunk in raw.chunks_exact(bytes_per_record) {
                 let node_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                for (i, val_chunk) in chunk[4..].chunks_exact(4).enumerate() {
-                    if i < ncomps {
-                        let val = f32::from_le_bytes(val_chunk.try_into().unwrap());
-                        components[i].values.insert(node_id, val);
-                        if val < components[i].min_val {
-                            components[i].min_val = val;
-                            components[i].min_node = node_id;
-                        }
-                        if val > components[i].max_val {
-                            components[i].max_val = val;
-                            components[i].max_node = node_id;
-                        }
+                for (val_idx, &comp_idx) in payload_indices.iter().enumerate() {
+                    let start = 4 + val_idx * 4;
+                    let val_chunk = &chunk[start..start + 4];
+                    let val = f32::from_le_bytes(val_chunk.try_into().unwrap());
+                    components[comp_idx].values.insert(node_id, val);
+                    if val < components[comp_idx].min_val {
+                        components[comp_idx].min_val = val;
+                        components[comp_idx].min_node = node_id;
+                    }
+                    if val > components[comp_idx].max_val {
+                        components[comp_idx].max_val = val;
+                        components[comp_idx].max_node = node_id;
                     }
                 }
             }
         } else if format_flag == 3 {
-            // Float64: 4 bytes node_id + ncomps * 8 bytes double values
-            let bytes_per_record = 4 + ncomps * 8;
+            // Float64: 4 bytes node_id + nvals * 8 bytes double values
+            let bytes_per_record = 4 + nvals * 8;
             let total_bytes = nod_data * bytes_per_record;
             let raw = self.cursor.read_exact(total_bytes).ok_or_else(|| {
                 FrdError::InvalidFormat(format!("Unexpected EOF reading binary double dataset {}", field_name))
@@ -497,22 +552,25 @@ impl<'a> FrdParserEngine<'a> {
 
             for chunk in raw.chunks_exact(bytes_per_record) {
                 let node_id = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                for (i, val_chunk) in chunk[4..].chunks_exact(8).enumerate() {
-                    if i < ncomps {
-                        let val = f64::from_le_bytes(val_chunk.try_into().unwrap()) as f32;
-                        components[i].values.insert(node_id, val);
-                        if val < components[i].min_val {
-                            components[i].min_val = val;
-                            components[i].min_node = node_id;
-                        }
-                        if val > components[i].max_val {
-                            components[i].max_val = val;
-                            components[i].max_node = node_id;
-                        }
+                for (val_idx, &comp_idx) in payload_indices.iter().enumerate() {
+                    let start = 4 + val_idx * 8;
+                    let val_chunk = &chunk[start..start + 8];
+                    let val = f64::from_le_bytes(val_chunk.try_into().unwrap()) as f32;
+                    components[comp_idx].values.insert(node_id, val);
+                    if val < components[comp_idx].min_val {
+                        components[comp_idx].min_val = val;
+                        components[comp_idx].min_node = node_id;
+                    }
+                    if val > components[comp_idx].max_val {
+                        components[comp_idx].max_val = val;
+                        components[comp_idx].max_node = node_id;
                     }
                 }
             }
         }
+
+        // Post-process derived components (e.g. ALL magnitude)
+        Self::derive_magnitude_components(&field_name, &mut components);
 
         let field_type = match field_name.to_uppercase().as_str() {
             "DISP" => FieldType::Displacement,
@@ -530,5 +588,65 @@ impl<'a> FrdParserEngine<'a> {
             value,
             components,
         })
+    }
+
+    /// Derive vector magnitude for components like ALL if missing from payload
+    fn derive_magnitude_components(field_name: &str, components: &mut [ComponentData]) {
+        let is_disp = field_name.to_uppercase().contains("DISP");
+        if !is_disp {
+            return;
+        }
+
+        let all_idx = components.iter().position(|c| c.name.eq_ignore_ascii_case("ALL"));
+        let d1_idx = components.iter().position(|c| {
+            let n = c.name.to_uppercase();
+            n == "D1" || n == "X" || n == "ND1"
+        });
+        let d2_idx = components.iter().position(|c| {
+            let n = c.name.to_uppercase();
+            n == "D2" || n == "Y" || n == "ND2"
+        });
+        let d3_idx = components.iter().position(|c| {
+            let n = c.name.to_uppercase();
+            n == "D3" || n == "Z" || n == "ND3"
+        });
+
+        if let Some(target_idx) = all_idx {
+            if components[target_idx].values.is_empty() {
+                let all_nodes: HashSet<u32> = components
+                    .iter()
+                    .flat_map(|c| c.values.keys().copied())
+                    .collect();
+
+                let mut min_val = f32::MAX;
+                let mut min_node = 0;
+                let mut max_val = f32::MIN;
+                let mut max_node = 0;
+
+                for nid in all_nodes {
+                    let vx = d1_idx.and_then(|i| components[i].values.get(&nid).copied()).unwrap_or(0.0);
+                    let vy = d2_idx.and_then(|i| components[i].values.get(&nid).copied()).unwrap_or(0.0);
+                    let vz = d3_idx.and_then(|i| components[i].values.get(&nid).copied()).unwrap_or(0.0);
+                    let mag = (vx * vx + vy * vy + vz * vz).sqrt();
+
+                    if mag < min_val {
+                        min_val = mag;
+                        min_node = nid;
+                    }
+                    if mag > max_val {
+                        max_val = mag;
+                        max_node = nid;
+                    }
+                    components[target_idx].values.insert(nid, mag);
+                }
+
+                if !components[target_idx].values.is_empty() {
+                    components[target_idx].min_val = min_val;
+                    components[target_idx].min_node = min_node;
+                    components[target_idx].max_val = max_val;
+                    components[target_idx].max_node = max_node;
+                }
+            }
+        }
     }
 }

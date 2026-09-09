@@ -89,6 +89,252 @@ pub fn displacement_magnitude(ux: f32, uy: f32, uz: f32) -> f32 {
     (ux * ux + uy * uy + uz * uz).sqrt()
 }
 
+use crate::model::{ComponentData, Dataset, FieldType, FrdModel};
+use rayon::prelude::*;
+use std::collections::HashSet;
+
+/// Extrema statistics for a stress dataset at a given step
+#[derive(Debug, Clone, PartialEq)]
+pub struct StressExtremaSummary {
+    pub step_number: u32,
+    pub increment_number: u32,
+    pub value: f32, // Time point or Frequency
+    pub max_von_mises: (f32, u32),       // (value, node_id)
+    pub min_von_mises: (f32, u32),
+    pub max_principal_s1: (f32, u32),
+    pub min_principal_s3: (f32, u32),
+    pub max_tresca: (f32, u32),
+    pub max_hydrostatic: (f32, u32),
+    pub node_count: usize,
+}
+
+/// Extrema statistics for a displacement dataset at a given step
+#[derive(Debug, Clone, PartialEq)]
+pub struct DispExtremaSummary {
+    pub step_number: u32,
+    pub increment_number: u32,
+    pub value: f32,
+    pub max_disp: (f32, u32),
+    pub min_disp: (f32, u32),
+    pub node_count: usize,
+}
+
+fn find_comp_idx(comps: &[ComponentData], names: &[&str]) -> Option<usize> {
+    comps.iter().position(|c| {
+        let clean = c.name.trim().to_uppercase();
+        names.iter().any(|&n| clean == n.to_uppercase())
+    })
+}
+
+/// Compute stress invariants (von Mises, Principal Stresses, Tresca) in parallel with Rayon.
+pub fn compute_dataset_stress_invariants(
+    ds: &Dataset,
+    filter_nodes: Option<&HashSet<u32>>,
+) -> Option<StressExtremaSummary> {
+    let comps = &ds.components;
+    let idx_xx = find_comp_idx(comps, &["SXX", "XX", "S11", "11"])?;
+    let idx_yy = find_comp_idx(comps, &["SYY", "YY", "S22", "22"])?;
+    let idx_zz = find_comp_idx(comps, &["SZZ", "ZZ", "S33", "33"])?;
+    let idx_xy = find_comp_idx(comps, &["SXY", "XY", "S12", "12"])?;
+    let idx_yz = find_comp_idx(comps, &["SYZ", "YZ", "S23", "23"])?;
+    let idx_zx = find_comp_idx(comps, &["SZX", "ZX", "S31", "31", "S13", "13"])?;
+
+    let xx_vals = &comps[idx_xx].values;
+    let yy_vals = &comps[idx_yy].values;
+    let zz_vals = &comps[idx_zz].values;
+    let xy_vals = &comps[idx_xy].values;
+    let yz_vals = &comps[idx_yz].values;
+    let zx_vals = &comps[idx_zx].values;
+
+    let candidate_nodes: Vec<u32> = if let Some(filter) = filter_nodes {
+        xx_vals.keys().copied().filter(|id| filter.contains(id)).collect()
+    } else {
+        xx_vals.keys().copied().collect()
+    };
+
+    if candidate_nodes.is_empty() {
+        return None;
+    }
+
+    // Parallel invariant computation
+    let results: Vec<(u32, f32, (f32, f32, f32), f32, f32)> = candidate_nodes
+        .par_iter()
+        .filter_map(|&nid| {
+            let sxx = *xx_vals.get(&nid)?;
+            let syy = *yy_vals.get(&nid)?;
+            let szz = *zz_vals.get(&nid)?;
+            let sxy = *xy_vals.get(&nid)?;
+            let syz = *yz_vals.get(&nid)?;
+            let szx = *zx_vals.get(&nid)?;
+
+            let tensor = StressTensor::new(sxx, syy, szz, sxy, syz, szx);
+            let vm = tensor.von_mises();
+            let prin = tensor.principal_stresses();
+            let tresca = tensor.max_shear();
+            let hydro = tensor.hydrostatic();
+            Some((nid, vm, prin, tresca, hydro))
+        })
+        .collect();
+
+    if results.is_empty() {
+        return None;
+    }
+
+    let mut max_vm = (-f32::INFINITY, 0);
+    let mut min_vm = (f32::INFINITY, 0);
+    let mut max_s1 = (-f32::INFINITY, 0);
+    let mut min_s3 = (f32::INFINITY, 0);
+    let mut max_tresca = (-f32::INFINITY, 0);
+    let mut max_hydro = (-f32::INFINITY, 0);
+
+    for (nid, vm, (s1, _, s3), tresca, hydro) in results {
+        if vm > max_vm.0 { max_vm = (vm, nid); }
+        if vm < min_vm.0 { min_vm = (vm, nid); }
+        if s1 > max_s1.0 { max_s1 = (s1, nid); }
+        if s3 < min_s3.0 { min_s3 = (s3, nid); }
+        if tresca > max_tresca.0 { max_tresca = (tresca, nid); }
+        if hydro > max_hydro.0 { max_hydro = (hydro, nid); }
+    }
+
+    Some(StressExtremaSummary {
+        step_number: ds.step_number,
+        increment_number: 1,
+        value: ds.value,
+        max_von_mises: max_vm,
+        min_von_mises: min_vm,
+        max_principal_s1: max_s1,
+        min_principal_s3: min_s3,
+        max_tresca,
+        max_hydrostatic: max_hydro,
+        node_count: candidate_nodes.len(),
+    })
+}
+
+/// Compute displacement magnitude extrema in parallel with Rayon.
+pub fn compute_dataset_disp_invariants(
+    ds: &Dataset,
+    filter_nodes: Option<&HashSet<u32>>,
+) -> Option<DispExtremaSummary> {
+    let comps = &ds.components;
+
+    // Check if ALL magnitude component is explicitly available and populated
+    let all_idx = find_comp_idx(comps, &["ALL", "MAG", "TOTAL"])
+        .filter(|&i| !comps[i].values.is_empty());
+    let x_idx = find_comp_idx(comps, &["D1", "X", "DX", "U1"]);
+    let y_idx = find_comp_idx(comps, &["D2", "Y", "DY", "U2"]);
+    let z_idx = find_comp_idx(comps, &["D3", "Z", "DZ", "U3"]);
+
+    let candidate_nodes: Vec<u32> = if let Some(all_i) = all_idx {
+        if let Some(filter) = filter_nodes {
+            comps[all_i].values.keys().copied().filter(|id| filter.contains(id)).collect()
+        } else {
+            comps[all_i].values.keys().copied().collect()
+        }
+    } else if let Some(xi) = x_idx {
+        if let Some(filter) = filter_nodes {
+            comps[xi].values.keys().copied().filter(|id| filter.contains(id)).collect()
+        } else {
+            comps[xi].values.keys().copied().collect()
+        }
+    } else {
+        return None;
+    };
+
+    if candidate_nodes.is_empty() {
+        return None;
+    }
+
+    let results: Vec<(u32, f32)> = if let Some(all_i) = all_idx.filter(|&i| !comps[i].values.is_empty()) {
+        let vals = &comps[all_i].values;
+        candidate_nodes
+            .par_iter()
+            .filter_map(|&nid| vals.get(&nid).map(|&v| (nid, v)))
+            .collect()
+    } else {
+        let xi = x_idx.unwrap();
+        let yi = y_idx.unwrap();
+        let zi = z_idx.unwrap();
+        let x_vals = &comps[xi].values;
+        let y_vals = &comps[yi].values;
+        let z_vals = &comps[zi].values;
+
+        candidate_nodes
+            .par_iter()
+            .filter_map(|&nid| {
+                let ux = *x_vals.get(&nid)?;
+                let uy = *y_vals.get(&nid)?;
+                let uz = *z_vals.get(&nid)?;
+                Some((nid, displacement_magnitude(ux, uy, uz)))
+            })
+            .collect()
+    };
+
+    if results.is_empty() {
+        return None;
+    }
+
+    let mut max_disp = (-f32::INFINITY, 0);
+    let mut min_disp = (f32::INFINITY, 0);
+
+    for (nid, d) in results {
+        if d > max_disp.0 { max_disp = (d, nid); }
+        if d < min_disp.0 { min_disp = (d, nid); }
+    }
+
+    Some(DispExtremaSummary {
+        step_number: ds.step_number,
+        increment_number: 1,
+        value: ds.value,
+        max_disp,
+        min_disp,
+        node_count: candidate_nodes.len(),
+    })
+}
+
+impl FrdModel {
+    /// Compute peak stress history across all steps/increments in the model
+    pub fn compute_stress_history(
+        &self,
+        filter_nodes: Option<&HashSet<u32>>,
+    ) -> Vec<StressExtremaSummary> {
+        let mut history = Vec::new();
+        for step in &self.steps {
+            for ds in &step.datasets {
+                if ds.field_type == FieldType::Stress || ds.name.to_uppercase().contains("STRESS") {
+                    if let Some(mut summ) = compute_dataset_stress_invariants(ds, filter_nodes) {
+                        summ.step_number = step.step_number;
+                        summ.increment_number = step.increment_number;
+                        summ.value = step.value;
+                        history.push(summ);
+                    }
+                }
+            }
+        }
+        history
+    }
+
+    /// Compute peak displacement history across all steps/increments in the model
+    pub fn compute_disp_history(
+        &self,
+        filter_nodes: Option<&HashSet<u32>>,
+    ) -> Vec<DispExtremaSummary> {
+        let mut history = Vec::new();
+        for step in &self.steps {
+            for ds in &step.datasets {
+                if ds.field_type == FieldType::Displacement || ds.name.to_uppercase().contains("DISP") {
+                    if let Some(mut summ) = compute_dataset_disp_invariants(ds, filter_nodes) {
+                        summ.step_number = step.step_number;
+                        summ.increment_number = step.increment_number;
+                        summ.value = step.value;
+                        history.push(summ);
+                    }
+                }
+            }
+        }
+        history
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -167,8 +167,128 @@ impl FrdModel {
         self.node_index.get(&id).map(|&idx| &self.nodes[idx])
     }
 
-    /// Retrieve a set by its name
+    /// Retrieve a set by its name (case-insensitive lookup)
     pub fn get_set(&self, name: &str) -> Option<&Set> {
-        self.sets.get(name)
+        if let Some(s) = self.sets.get(name) {
+            return Some(s);
+        }
+        let upper = name.to_uppercase();
+        self.sets.iter().find_map(|(k, v)| {
+            if k.to_uppercase() == upper {
+                Some(v)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Resolve all unique node IDs belonging to a set (expanding element sets to constituent nodes)
+    pub fn resolve_set_node_ids(&self, set_name: &str) -> Option<std::collections::HashSet<u32>> {
+        let set = self.get_set(set_name)?;
+        let mut node_ids = std::collections::HashSet::new();
+
+        // Add explicit node IDs
+        for &nid in &set.node_ids {
+            node_ids.insert(nid);
+        }
+
+        // Expand element IDs to node IDs if present
+        if !set.element_ids.is_empty() {
+            let elem_map: HashMap<u32, &Element> = self.elements.iter().map(|e| (e.id, e)).collect();
+            for &eid in &set.element_ids {
+                if let Some(elem) = elem_map.get(&eid) {
+                    for &nid in &elem.nodes {
+                        node_ids.insert(nid);
+                    }
+                }
+            }
+        }
+
+        Some(node_ids)
+    }
+
+    /// Populate implicit sets for element types (+C3D20, +C3D10, etc.) and materials (+mat1, etc.)
+    pub fn populate_implicit_sets(&mut self) {
+        let mut type_sets: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut mat_sets: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut all_elem_ids = Vec::with_capacity(self.elements.len());
+
+        for el in &self.elements {
+            all_elem_ids.push(el.id);
+            let type_name = format!("+{:?}", el.elem_type);
+            type_sets.entry(type_name).or_default().push(el.id);
+
+            let mat_name = format!("+mat{}", el.material_id);
+            mat_sets.entry(mat_name).or_default().push(el.id);
+        }
+
+        // Add all elements set
+        self.sets.insert(
+            "+all".to_string(),
+            Set {
+                name: "+all".to_string(),
+                set_type: SetType::Mixed,
+                node_ids: self.nodes.iter().map(|n| n.id).collect(),
+                element_ids: all_elem_ids,
+            },
+        );
+
+        // Add element type sets
+        for (name, eids) in type_sets {
+            self.sets.insert(
+                name.clone(),
+                Set {
+                    name,
+                    set_type: SetType::Element,
+                    node_ids: Vec::new(),
+                    element_ids: eids,
+                },
+            );
+        }
+
+        // Add material sets
+        for (name, eids) in mat_sets {
+            self.sets.insert(
+                name.clone(),
+                Set {
+                    name,
+                    set_type: SetType::Element,
+                    node_ids: Vec::new(),
+                    element_ids: eids,
+                },
+            );
+        }
+    }
+
+    /// Automatically discover and merge companion sets from `<stem>.inp` and `*.nam` files
+    pub fn load_companion_sets<P: AsRef<std::path::Path>>(&mut self, frd_path: P) {
+        let companion_sets = crate::parser::load_companion_sets(frd_path);
+        for (name, set) in companion_sets {
+            let entry = self.sets.entry(name).or_insert_with(|| Set {
+                name: set.name.clone(),
+                set_type: set.set_type.clone(),
+                node_ids: Vec::new(),
+                element_ids: Vec::new(),
+            });
+            entry.node_ids.extend(set.node_ids);
+            entry.element_ids.extend(set.element_ids);
+        }
+    }
+
+    /// Load and merge sets from an explicit `.inp` or `.nam` file
+    pub fn load_inp_sets<P: AsRef<std::path::Path>>(&mut self, inp_path: P) -> crate::Result<usize> {
+        let inp_sets = crate::parser::parse_sets_from_inp(inp_path)?;
+        let count = inp_sets.len();
+        for (name, set) in inp_sets {
+            let entry = self.sets.entry(name).or_insert_with(|| Set {
+                name: set.name.clone(),
+                set_type: set.set_type.clone(),
+                node_ids: Vec::new(),
+                element_ids: Vec::new(),
+            });
+            entry.node_ids.extend(set.node_ids);
+            entry.element_ids.extend(set.element_ids);
+        }
+        Ok(count)
     }
 }
