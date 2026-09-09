@@ -2,9 +2,11 @@
 
 pub mod model;
 pub mod invariants;
+pub mod parser;
 
 pub use model::*;
 pub use invariants::*;
+pub use parser::{parse_frd_file, FrdParserEngine};
 
 use thiserror::Error;
 

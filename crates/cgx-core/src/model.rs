@@ -24,17 +24,58 @@ pub enum ElementType {
     C3D15,  // 15-node quadratic wedge / prism
     
     // 2D Shells / Plates
-    S3,     // 3-node triangular shell
-    S4,     // 4-node quadrilateral shell
-    S8,     // 8-node quadratic shell
+    S3,     // 3-node triangular shell (TRI3, code 7)
+    S6,     // 6-node quadratic triangle shell (TRI6, code 8)
+    S4,     // 4-node quadrilateral shell (QUAD4, code 9)
+    S8,     // 8-node quadratic shell (QUAD8, code 10)
     
     // 1D Beams / Trusses
-    B31,    // 2-node beam
-    B32,    // 3-node quadratic beam
+    B31,    // 2-node beam (BEAM2, code 11)
+    B32,    // 3-node quadratic beam (BEAM3, code 12)
     T3D2,   // 2-node truss
     
     // Fallback for unknown / custom elements
     Other(i32),
+}
+
+impl ElementType {
+    /// Expected number of nodes for this element topology
+    pub fn node_count(&self) -> usize {
+        match self {
+            ElementType::C3D8 => 8,
+            ElementType::C3D6 => 6,
+            ElementType::C3D4 => 4,
+            ElementType::C3D20 | ElementType::C3D20R => 20,
+            ElementType::C3D15 => 15,
+            ElementType::C3D10 => 10,
+            ElementType::S3 => 3,
+            ElementType::S6 => 6,
+            ElementType::S4 => 4,
+            ElementType::S8 => 8,
+            ElementType::B31 | ElementType::T3D2 => 2,
+            ElementType::B32 => 3,
+            ElementType::Other(_) => 0,
+        }
+    }
+
+    /// Convert CGX integer element type code (from readfrd.c) to ElementType
+    pub fn from_cgx_code(code: i32) -> Self {
+        match code {
+            1 => ElementType::C3D8,
+            2 => ElementType::C3D6,
+            3 => ElementType::C3D4,
+            4 => ElementType::C3D20,
+            5 => ElementType::C3D15,
+            6 => ElementType::C3D10,
+            7 => ElementType::S3,
+            8 => ElementType::S6,
+            9 => ElementType::S4,
+            10 => ElementType::S8,
+            11 => ElementType::B31,
+            12 => ElementType::B32,
+            other => ElementType::Other(other),
+        }
+    }
 }
 
 /// Finite element definition with topology and node connectivity
