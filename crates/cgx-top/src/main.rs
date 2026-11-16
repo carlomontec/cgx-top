@@ -1,11 +1,13 @@
 mod ascii_plot;
 mod sparkline;
+mod tui;
 
 use ascii_plot::render_ascii_plot;
 use clap::{Parser, Subcommand};
 use sparkline::render_sparkline;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use cgx_core::{
     consolidate_inp, inspect_inp, parse_frd_file, FrdModel, InpSummary, StepInfo,
@@ -739,10 +741,13 @@ fn main() -> anyhow::Result<()> {
             args.equidistant,
             args.no_plot,
         );
-    } else {
-        // Default summary view
+    } else if !std::io::stdout().is_terminal() || args.summary || args.all || args.equidistant.is_some() {
+        // Non-interactive batch summary view
         println!("Loaded in {:.2?}", load_time);
         print_summary(&primary_file, &model, args.all, args.equidistant);
+    } else {
+        // Launch Interactive Terminal TUI Dashboard!
+        tui::run_tui(model, &primary_file, args.set.as_deref())?;
     }
 
     Ok(())
