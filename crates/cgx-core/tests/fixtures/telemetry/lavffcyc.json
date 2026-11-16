@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "jobname": "lavffcyc",
+    "ccx_version": "2.21-multisolver",
+    "solver": "SPOOLES",
+    "num_threads": 1,
+    "success": true,
+    "exit_code": 0,
+    "timings": {
+      "total_wall_time_s": 540.599330
+    },
+    "mesh_statistics": {
+      "nodes": 48909,
+      "elements": 10816,
+      "equations": 283024
+    }
+  },
+  "steps": [
+    {
+      "step_number": 1,
+      "type": "STATIC",
+      "converged": true
+    },
+    {
+      "step_number": 2,
+      "type": "FREQUENCY",
+      "converged": true,
+      "total_effective_mass": {
+        "x": 2.1384018479e-05, "y": 2.1393731218e-05, "z": 2.1392718473e-05,
+        "rx": 1.0346909723e-02, "ry": 1.3928924984e-02, "rz": 5.4955380199e-03
+      },
+      "fraction_of_totals": {
+        "x": 1.2481447770e-01, "y": 5.8885567273e-02, "z": 6.4304997912e-03,
+        "rx": 9.6338070669e-02, "ry": 1.6644596484e-01, "rz": 1.9097303522e-01
+      }
+    }
+  ]
+}

@@ -3,13 +3,17 @@
 pub mod model;
 pub mod invariants;
 pub mod parser;
+pub mod telemetry;
 
 pub use model::*;
 pub use invariants::*;
+pub use telemetry::*;
 pub use parser::{
     consolidate_inp, inspect_inp, load_companion_sets, parse_frd_file, parse_sets_from_inp,
     parse_sets_from_str, ByteCursor, DatasetEntry, DenseDataset, FrdIndex, FrdParserEngine, StepRef, InpConsolidateStats, InpInclude, InpSummary,
 };
+
+pub use parser::inp_cards::*;
 
 use thiserror::Error;
 

@@ -97,3 +97,30 @@ Consequences for `MCP_SPEC.md`: the digest sidecar, the model LRU and the `FRD_L
 ### Out of scope for step 1
 
 Migrating the CLI/TUI to `FrdIndex`, fixing `increment_number`/`description`, reading `-2` continuation records. Each becomes its own follow-up once step 1 is verified.
+
+## Status log
+
+### 2026-11-16 — MCP server first slice (uncommitted, branch `feat/frd-lazy-index`)
+
+- Order changed: the MCP adapter is built first; steps 2 (telemetry + diagnose) and 4 (card scanner) are delegated to Sonnet subagents in separate worktrees and integrated when they report.
+- Verified facts: `rmcp` is at **3.10.0** (features `server`, `macros`, `transport-io`, `schemars`; schemars 1.x). The latest MCP revision is **2026-07-28**; rmcp negotiates down, and the server was exercised with a `2025-06-18` handshake. `MCP_SPEC.md` §1 is outdated on both points.
+- `crates/calculix-mcp` exists and serves over stdio: `inp_inspect`, `inp_consolidate`, `frd_summary`, `frd_sets`, `frd_query_set`. Structured output with output schemas, annotations, structured errors with `valid` alternatives, path confinement (`--root`, repeatable).
+- Simplifications against `MCP_SPEC.md`: plain `offset`/`limit` paging instead of hashed cursors; no cache (a fresh `FrdIndex` per call); no resources, prompts or config file yet.
+- Still to do in the adapter: `ccx_solve`, `ccx_job_status`, `ccx_job_cancel` (job supervisor, MCP_SPEC §3), then `ccx_diagnose` and `inp_cards` once the subagent work is merged.
+- Found: sets defined in both a `.nam` file and the deck get their ids listed twice in `FrdModel.sets` (counts doubled; the MCP tools count distinct ids). `beam_benchmark.inp` in `test_NewLib` references `all.msh` and `TOP.dlo`, which are not in that folder.
+
+### 2026-11-16 — card scanner integrated (uncommitted)
+
+- Step 4 delivered by a Sonnet subagent and copied in: `parser/inp_cards.rs` + `tests/inp_cards.rs` (22 tests). `inp_inspect` now returns flags, keyword census, step plan and external refs; new tool `inp_cards`. Checked live on `lavffcyc.inp`.
+- Learned about `inp.rs`: `consolidate_inp` does not inline `INPUT=` on non-INCLUDE cards; its cycle check never pops, so a file included twice (diamond) is wrongly reported as circular; depth limit hard-coded to 10; a missing include is an error there. `inspect_inp` silently skips cycles and depth > 10. To fix before `ccx_solve` relies on consolidation.
+- Subagent worktrees branch from `main`, not from the feature branch, so their briefs must not rely on uncommitted or branch-only files.
+- Pending: telemetry/diagnose subagent (step 2) still running; then `ccx_diagnose`; then the job tools.
+
+### 2026-11-16 — telemetry + diagnose integrated (uncommitted)
+
+- Step 2 delivered by a Sonnet subagent and copied in: `cgx-core/src/telemetry/{sta,cvg,diagnose}.rs`, `tests/telemetry.rs` (29 tests), 43 fixture files, `cgx-top diagnose <job>`. New MCP tool `ccx_diagnose` (path-based). Server now has 7 tools; 10 unit tests in `calculix-mcp`.
+- Real `.cvg` rows obtained from ccx runs of `contact8/9/13`: the 9-column layout is confirmed. None of the real runs had a cutback or a divergence, so the C/B/D thresholds remain calibrated on synthetic fixtures only.
+- Deviations from MCP_SPEC §4 made by the subagent, accepted: relative-growth branch of D2 requires the residual above 1 % (a healthy real run tripped the literal rule); the last increment of a step is excluded from the S1 "increment never shrinks" check; D2/D3 on an attempt that later recovered still read as DIVERGED (to revisit with real cutback data).
+- Facts correction: `lavffcyc.sta` and `beam_benchmark.sta` are not header-only; each has one linear row.
+- Remaining for the adapter: `ccx_solve`, `ccx_job_status`, `ccx_job_cancel` (MCP_SPEC §3), feeding `running`, exit status and stdout into `ccx_diagnose`. Before that: fix the `consolidate_inp` issues listed above.
+- Remaining elsewhere: step 3 (`--json` on the CLI), step 6 (CGX command channel), FRD follow-ups (PSTEP/PHID/PMODE metadata, PDISP, STRESSI), duplicate set ids.

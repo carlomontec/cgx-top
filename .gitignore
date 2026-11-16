@@ -19,3 +19,6 @@ Cargo.lock
 *.sta
 *.12d
 *.vtu
+
+# Test fixtures are tracked even when they look like simulation output
+!crates/*/tests/fixtures/**

@@ -10,7 +10,8 @@ use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use cgx_core::{
-    consolidate_inp, inspect_inp, parse_frd_file, FrdModel, InpSummary, StepInfo,
+    consolidate_inp, diagnose, inspect_inp, parse_cvg, parse_frd_file, parse_sta, DiagCtx,
+    FrdModel, InpSummary, StepInfo, Thresholds,
 };
 
 /// The terminal companion to CalculiX GraphiX (CGX).
@@ -96,6 +97,71 @@ pub enum Commands {
         #[arg(value_name = "INP_FILE")]
         file: PathBuf,
     },
+    /// Diagnose solver convergence from a job's .sta/.cvg telemetry
+    Diagnose {
+        /// Job path, with or without a .inp/.sta/.cvg extension
+        #[arg(value_name = "JOB")]
+        job: PathBuf,
+    },
+}
+
+/// Reads `(step_number, converged)` pairs from a ccx `<job>.json` without a JSON parser.
+fn read_json_steps(path: &Path) -> Vec<(u32, bool)> {
+    let Ok(text) = fs::read_to_string(path) else { return Vec::new() };
+    let num = |s: &str| s.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+    text.split("\"step_number\":")
+        .skip(1)
+        .filter_map(|chunk| {
+            let step = num(chunk).parse().ok()?;
+            let conv = chunk.split("\"converged\":").nth(1)?.trim_start();
+            Some((step, conv.starts_with("true")))
+        })
+        .collect()
+}
+
+fn execute_diagnose(job: &Path) -> anyhow::Result<()> {
+    let is_job_ext = job
+        .extension()
+        .and_then(|e| e.to_str())
+        .map_or(false, |e| ["inp", "sta", "cvg"].iter().any(|x| e.eq_ignore_ascii_case(x)));
+    let base = if is_job_ext { job.with_extension("") } else { job.to_path_buf() };
+    let read = |ext: &str| fs::read_to_string(format!("{}.{}", base.display(), ext)).unwrap_or_default();
+    let sta = parse_sta(&read("sta"));
+    let cvg = parse_cvg(&read("cvg"));
+    let ctx = DiagCtx {
+        running: false,
+        exit_failed: false,
+        json_steps: read_json_steps(&PathBuf::from(format!("{}.json", base.display()))),
+        stdout_tail: String::new(),
+    };
+    let d = diagnose(&sta, &cvg, &ctx, &Thresholds::default(), None, 10);
+
+    println!("Job:     {}", base.display());
+    println!("Verdict: {}", d.verdict.as_str());
+    println!("Rows:    {} .sta, {} .cvg", sta.len(), cvg.len());
+    for f in &d.findings {
+        let at = match (f.step, f.inc, f.att) {
+            (Some(s), Some(i), Some(a)) => format!("step {s} inc {i} att {a}"),
+            _ => "-".to_string(),
+        };
+        let ev: Vec<String> = f.evidence.iter().map(|(k, v)| format!("{k}={v:.4}")).collect();
+        println!("\n[{}] {} at {} (x{})", f.rule, f.severity.as_str(), at, f.occurrences);
+        if !ev.is_empty() {
+            println!("  evidence: {}", ev.join(" "));
+        }
+        if !f.advice.is_empty() {
+            println!("  advice:   {}", f.advice);
+        }
+    }
+    for m in &d.solver_messages {
+        println!("\nsolver: {m}");
+    }
+    println!("\nLast {} .sta rows:", sta.len().min(10));
+    println!("  {:>5} {:>5} {:>4} {:>5} {:>13} {:>13} {:>13}", "STEP", "INC", "ATT", "ITRS", "TOT TIME", "STEP TIME", "INC TIME");
+    for r in &sta[sta.len().saturating_sub(10)..] {
+        println!("  {:>5} {:>5} {:>4} {:>5} {:>13.6e} {:>13.6e} {:>13.6e}", r.step, r.inc, r.att, r.itrs, r.tot_time, r.step_time, r.inc_time);
+    }
+    Ok(())
 }
 
 fn execute_consolidate(inp_path: &Path, output_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -668,6 +734,9 @@ fn main() -> anyhow::Result<()> {
             }
             Commands::Check { file } => {
                 return execute_inp_check(&file);
+            }
+            Commands::Diagnose { job } => {
+                return execute_diagnose(&job);
             }
         }
     }

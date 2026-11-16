@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cgx-core",
     "crates/cgx-top",
+    "crates/calculix-mcp",
 ]
 
 [workspace.package]
