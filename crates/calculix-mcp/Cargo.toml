@@ -20,3 +20,6 @@ schemars = "1"
 clap = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

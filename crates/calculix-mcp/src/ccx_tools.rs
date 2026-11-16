@@ -1,9 +1,11 @@
-//! Solver tools. `ccx_diagnose` explains convergence from `<job>.sta` / `<job>.cvg` / `<job>.json`.
+//! Solver tools: `ccx_solve`, `ccx_job_status`, `ccx_job_cancel` (background jobs, see `jobs.rs`)
+//! and `ccx_diagnose`, which explains convergence from `<job>.sta` / `<job>.cvg` / `<job>.json`.
 
 use crate::error::ToolError;
 use crate::frd_tools::{num, Table};
 use crate::paths::Roots;
-use cgx_core::{diagnose, parse_cvg, parse_sta, DiagCtx, Thresholds};
+use crate::jobs::{rss_mb, JobManager, Manifest, Prepared, State};
+use cgx_core::{diagnose, parse_cvg, parse_sta, scan_cards, DiagCtx, ScanLimits, Thresholds};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -13,8 +15,10 @@ const JOB_EXTENSIONS: [&str; 6] = ["inp", "sta", "cvg", "frd", "dat", "json"];
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CcxDiagnoseIn {
-    /// Path to the job, with or without extension: "run/beam", "run/beam.inp", "run/beam.sta"
-    pub job_path: String,
+    /// Path to the job, with or without extension: "run/beam", "run/beam.inp", "run/beam.sta". Give this or job_id
+    pub job_path: Option<String>,
+    /// Id returned by ccx_solve. Adds process state and solver output to the diagnosis
+    pub job_id: Option<String>,
     /// Step to analyse. Default: all steps
     pub step: Option<u32>,
     /// Number of most recent increments to analyse and list (default 10, max 50)
@@ -89,8 +93,54 @@ fn read_json(path: &Path) -> Option<(Vec<(u32, bool)>, Option<bool>)> {
     Some((steps, v["meta"]["success"].as_bool()))
 }
 
-pub fn run_diagnose(roots: &Roots, p: CcxDiagnoseIn) -> Result<CcxDiagnoseOut, ToolError> {
-    let base = job_base(roots, &p.job_path)?;
+/// What the job manager knows about a job started by `ccx_solve`.
+pub struct JobView {
+    pub base: PathBuf,
+    pub running: bool,
+    pub failed: bool,
+    pub stdout_tail: String,
+}
+
+impl JobView {
+    pub fn of(m: &Manifest) -> Self {
+        Self {
+            base: m.base(),
+            running: !m.state.terminal(),
+            failed: matches!(m.state, State::Failed | State::TimedOut),
+            stdout_tail: tail_text(&m.run_dir.join("stdout.log"), 200, 16 * 1024).unwrap_or_default(),
+        }
+    }
+}
+
+/// Last `lines` lines of a text file, at most `max_bytes`, with a marker when cut.
+pub fn tail_text(path: &Path, lines: usize, max_bytes: usize) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let all: Vec<&str> = text.lines().collect();
+    // When the read started mid-file the first line is partial: drop it.
+    let usable = if start > 0 && all.len() > 1 { &all[1..] } else { &all[..] };
+    let kept = &usable[usable.len().saturating_sub(lines)..];
+    let cut = start > 0 || kept.len() < usable.len();
+    let mut out = String::new();
+    if cut {
+        out.push_str("\u{2026}[truncated: earlier output omitted]\n");
+    }
+    out.push_str(&kept.join("\n"));
+    Some(out)
+}
+
+pub fn run_diagnose(roots: &Roots, p: CcxDiagnoseIn, job: Option<JobView>) -> Result<CcxDiagnoseOut, ToolError> {
+    let base = match (&job, &p.job_path) {
+        (Some(j), _) => j.base.clone(),
+        (None, Some(path)) => job_base(roots, path)?,
+        (None, None) => return Err(ToolError::invalid("give job_path or job_id")),
+    };
     let read = |ext: &str| std::fs::read_to_string(with_ext(&base, ext)).ok();
     let (sta_text, cvg_text) = (read("sta"), read("cvg"));
     let telemetry = read_json(&with_ext(&base, "json"));
@@ -116,7 +166,12 @@ pub fn run_diagnose(roots: &Roots, p: CcxDiagnoseIn) -> Result<CcxDiagnoseOut, T
     let sta = sta_text.as_deref().map(parse_sta).unwrap_or_default();
     let cvg = cvg_text.as_deref().map(parse_cvg).unwrap_or_default();
     let (json_steps, success) = telemetry.clone().unwrap_or_default();
-    let ctx = DiagCtx { running: false, exit_failed: success == Some(false), json_steps, stdout_tail: String::new() };
+    let ctx = DiagCtx {
+        running: job.as_ref().is_some_and(|j| j.running),
+        exit_failed: success == Some(false) || job.as_ref().is_some_and(|j| j.failed),
+        json_steps,
+        stdout_tail: job.map(|j| j.stdout_tail).unwrap_or_default(),
+    };
     let window = p.last_increments.unwrap_or(10).clamp(1, 50);
     let d = diagnose(&sta, &cvg, &ctx, &Thresholds::default(), p.step, window);
 
@@ -176,6 +231,269 @@ pub fn run_diagnose(roots: &Roots, p: CcxDiagnoseIn) -> Result<CcxDiagnoseOut, T
     })
 }
 
+// ---------- ccx_solve ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CcxSolveIn {
+    /// Path to the root .inp deck
+    pub inp_path: String,
+    /// One of the solver names the server was started with. Default: the first one
+    pub solver: Option<String>,
+    /// Threads for the solver (default: up to 4, capped at the CPU count)
+    pub threads: Option<usize>,
+    /// Wall-clock limit in seconds (default 3600, max 86400)
+    pub timeout_s: Option<u64>,
+    /// Free-text label to recognise the job later
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CcxSolveOut {
+    pub job_id: String,
+    /// QUEUED when another job holds the single run slot, else STARTING
+    pub state: State,
+    /// Isolated directory holding a copy of the deck and all results
+    pub run_dir: String,
+    pub jobname: String,
+    pub solver: String,
+    pub threads: usize,
+    pub files_copied: usize,
+    pub flags: Vec<String>,
+    pub next: String,
+}
+
+fn valid_jobname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['-', '.'])
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Preflight the deck and copy it, with every file it references, into a fresh run directory.
+/// Blocking. The original deck directory is never written to.
+pub fn prepare_solve(roots: &Roots, jobs: &JobManager, p: CcxSolveIn) -> Result<(Prepared, usize, Vec<String>), ToolError> {
+    let (solver, binary) = jobs.solver(p.solver.as_deref())?;
+    let deck = roots.existing(&p.inp_path, &["inp"])?;
+    let jobname = deck.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+    if !valid_jobname(&jobname) {
+        return Err(ToolError::invalid(format!("deck name '{}' is not usable as a job name (letters, digits, _ - . only)", jobname)));
+    }
+
+    let scan = scan_cards(&deck, &ScanLimits::default())
+        .map_err(|e| ToolError::new("DECK_INVALID", format!("{}: {}", roots.display(&deck), e)))?;
+    let refs = scan.external_refs();
+    let missing: Vec<String> = scan
+        .includes
+        .iter()
+        .filter(|i| !i.exists)
+        .map(|i| format!("{}:{} -> {}", roots.display(&i.included_from), i.line_number, i.raw_target))
+        .chain(refs.iter().filter(|r| !r.exists).map(|r| format!("{}:{} -> {}", roots.display(&r.file), r.line, r.target)))
+        .collect();
+    if !missing.is_empty() {
+        return Err(ToolError::new("DECK_INVALID", format!("{} referenced file(s) are missing", missing.len()))
+            .valid(missing)
+            .hint("Fix the references, then call inp_inspect to verify."));
+    }
+    let flags: Vec<String> = scan.flags().into_iter().map(String::from).collect();
+    if flags.iter().any(|f| f == "NO_STEPS") {
+        return Err(ToolError::new("DECK_INVALID", "the deck has no *STEP").hint("Call inp_inspect to review the deck."));
+    }
+
+    // Every file must live under the deck directory so the run directory can mirror the layout.
+    let deck_dir = deck.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (source, path relative to the deck directory)
+    let sources = std::iter::once(deck.clone())
+        .chain(scan.includes.iter().map(|i| i.resolved_path.clone()))
+        .chain(refs.iter().map(|r| r.resolved_path.clone()));
+    for source in sources {
+        let canonical = source.canonicalize().map_err(ToolError::internal)?;
+        let rel = canonical.strip_prefix(&deck_dir).map(Path::to_path_buf).map_err(|_| {
+            ToolError::new("DECK_INVALID", format!("{} lies outside the deck directory", canonical.display()))
+                .hint("Call inp_consolidate to flatten the deck into one file, then solve that file.")
+        })?;
+        if !files.iter().any(|f| f.1 == rel) {
+            files.push((canonical, rel));
+        }
+    }
+
+    let (job_id, run_dir) = jobs.new_run_dir()?;
+    for (source, rel) in &files {
+        let target = run_dir.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(ToolError::internal)?;
+        }
+        std::fs::copy(source, &target).map_err(|e| ToolError::internal(format!("copying {}: {}", rel.display(), e)))?;
+    }
+
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let prepared = Prepared {
+        job_id,
+        run_dir,
+        source_inp: deck,
+        jobname,
+        solver,
+        binary,
+        threads: p.threads.unwrap_or(4).clamp(1, cpus),
+        timeout_s: p.timeout_s.unwrap_or(3600).clamp(1, 86_400),
+        label: p.label.map(|l| l.chars().take(60).collect()),
+    };
+    Ok((prepared, files.len(), flags))
+}
+
+pub fn solve_out(roots: &Roots, m: &Manifest, files_copied: usize, flags: Vec<String>) -> CcxSolveOut {
+    CcxSolveOut {
+        job_id: m.job_id.clone(),
+        state: m.state,
+        run_dir: roots.display(&m.run_dir),
+        jobname: m.jobname.clone(),
+        solver: m.solver.clone(),
+        threads: m.threads,
+        files_copied,
+        flags,
+        next: "Call ccx_job_status with this job_id and wait_s=30.".into(),
+    }
+}
+
+// ---------- ccx_job_status / ccx_job_cancel ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CcxJobStatusIn {
+    pub job_id: String,
+    /// Block up to this many seconds (max 50) and return early when the state changes
+    pub wait_s: Option<u64>,
+    /// Include the last N lines of solver output (max 100)
+    pub tail_lines: Option<usize>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct Progress {
+    pub step: u32,
+    pub inc: u32,
+    pub att: u32,
+    pub tot_time: Value,
+    pub inc_time: Value,
+    pub increments_done: usize,
+    /// Sum of (att - 1) over completed increments
+    pub cutbacks: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CcxJobStatusOut {
+    pub job_id: String,
+    pub state: State,
+    pub label: Option<String>,
+    pub jobname: String,
+    pub solver: String,
+    pub threads: usize,
+    pub elapsed_s: f64,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    /// Why the job failed: SPAWN | EXIT_CODE | SIGNAL | SOLVER_REPORTED | TIMEOUT | LOST, with detail
+    pub failure: Option<String>,
+    /// Resident memory of the solver process while it runs
+    pub rss_mb: Option<u64>,
+    /// Latest completed increment, from <job>.sta
+    pub progress: Option<Progress>,
+    /// Convergence verdict so far (same values as ccx_diagnose)
+    pub verdict: Option<String>,
+    /// 'meta' and 'steps' of <job>.json once the solver has written it
+    pub telemetry: Option<Value>,
+    /// Result files that exist, by kind
+    pub files: Map<String, Value>,
+    pub tail: Option<String>,
+    pub next: String,
+}
+
+/// Build the status view. Blocking (reads the run directory).
+pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatusOut {
+    let base = m.base();
+    let read = |ext: &str| std::fs::read_to_string(with_ext(&base, ext)).ok();
+    let sta = read("sta").as_deref().map(parse_sta).unwrap_or_default();
+    let cvg = read("cvg").as_deref().map(parse_cvg).unwrap_or_default();
+    let json: Option<Value> = read("json").and_then(|t| serde_json::from_str(&t).ok());
+
+    let progress = sta.last().map(|r| Progress {
+        step: r.step,
+        inc: r.inc,
+        att: r.att,
+        tot_time: num(r.tot_time as f32),
+        inc_time: num(r.inc_time as f32),
+        increments_done: sta.len(),
+        cutbacks: sta.iter().map(|r| r.att.saturating_sub(1)).sum(),
+    });
+
+    let view = JobView::of(m);
+    let verdict = (!sta.is_empty() || !cvg.is_empty()).then(|| {
+        let json_steps = read_json(&with_ext(&base, "json")).map(|j| j.0).unwrap_or_default();
+        let ctx = DiagCtx { running: view.running, exit_failed: view.failed, json_steps, stdout_tail: view.stdout_tail.clone() };
+        diagnose(&sta, &cvg, &ctx, &Thresholds::default(), None, 10).verdict.as_str().to_string()
+    });
+
+    let mut files = Map::new();
+    for ext in ["frd", "dat", "sta", "cvg", "json"] {
+        let path = with_ext(&base, ext);
+        if path.exists() {
+            files.insert(ext.into(), json!(roots.display(&path)));
+        }
+    }
+    for (kind, name) in [("stdout", "stdout.log"), ("stderr", "stderr.log")] {
+        let path = m.run_dir.join(name);
+        if std::fs::metadata(&path).is_ok_and(|md| md.len() > 0) {
+            files.insert(kind.into(), json!(roots.display(&path)));
+        }
+    }
+
+    let tail = (tail_lines > 0).then(|| {
+        let out = tail_text(&m.run_dir.join("stdout.log"), tail_lines.min(100), 4096).unwrap_or_default();
+        let err = tail_text(&m.run_dir.join("stderr.log"), 10, 1024).filter(|e| !e.trim().is_empty());
+        match err {
+            Some(e) => format!("{}\n--- stderr ---\n{}", out, e),
+            None => out,
+        }
+    });
+
+    let next = match m.state {
+        State::Queued | State::Starting | State::Running | State::Cancelling => "Call ccx_job_status again with wait_s=30.",
+        State::Succeeded => "Call frd_summary on files.frd.",
+        State::Failed | State::TimedOut => "Call ccx_diagnose with this job_id, and ccx_job_status with tail_lines=40 to read the solver output.",
+        State::Cancelled | State::Lost => "The job did not finish; call ccx_solve to run it again.",
+    };
+
+    CcxJobStatusOut {
+        job_id: m.job_id.clone(),
+        state: m.state,
+        label: m.label.clone(),
+        jobname: m.jobname.clone(),
+        solver: m.solver.clone(),
+        threads: m.threads,
+        elapsed_s: m.elapsed_s(),
+        exit_code: m.exit_code,
+        signal: m.signal,
+        failure: m.failure.clone(),
+        rss_mb: m.pid.filter(|_| m.state == State::Running).and_then(rss_mb),
+        progress,
+        verdict,
+        telemetry: json.map(|j| json!({ "meta": j["meta"], "steps": j["steps"] })),
+        files,
+        tail,
+        next: next.into(),
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CcxJobCancelIn {
+    pub job_id: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CcxJobCancelOut {
+    pub job_id: String,
+    /// State before the request
+    pub was: State,
+    /// State now. Already finished jobs are returned unchanged
+    pub state: State,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +503,7 @@ mod tests {
     }
 
     fn run(job: &str) -> Result<CcxDiagnoseOut, ToolError> {
-        run_diagnose(&fixtures(), CcxDiagnoseIn { job_path: job.into(), step: None, last_increments: None })
+        run_diagnose(&fixtures(), CcxDiagnoseIn { job_path: Some(job.into()), job_id: None, step: None, last_increments: None }, None)
     }
 
     #[test]
@@ -207,12 +525,24 @@ mod tests {
     }
 
     #[test]
+    fn jobname_rules_and_tail() {
+        assert!(valid_jobname("beam_v2.1-a") && !valid_jobname("-j") && !valid_jobname(".hidden") && !valid_jobname("a b") && !valid_jobname(""));
+        let path = std::env::temp_dir().join(format!("calculix-mcp-tail-{}", std::process::id()));
+        std::fs::write(&path, (1..=50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n")).unwrap();
+        let t = tail_text(&path, 3, 4096).unwrap();
+        assert!(t.starts_with('\u{2026}') && t.ends_with("line 48\nline 49\nline 50"), "{}", t);
+        assert_eq!(tail_text(&path, 100, 4096).unwrap().lines().count(), 50);
+        assert!(tail_text(&path, 100, 40).unwrap().lines().count() < 8);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn errors_are_actionable() {
         let missing = run("smoth").unwrap_err();
         assert_eq!((missing.code, missing.valid[0].as_str()), ("FILE_NOT_FOUND", "smooth"));
         assert!(missing.valid_total.unwrap() > 10 && missing.valid.len() == 10);
         assert_eq!(run("../../../Cargo").unwrap_err().code, "PATH_OUTSIDE_ROOTS");
-        let step = run_diagnose(&fixtures(), CcxDiagnoseIn { job_path: "smooth".into(), step: Some(9), last_increments: None }).unwrap_err();
+        let step = run_diagnose(&fixtures(), CcxDiagnoseIn { job_path: Some("smooth".into()), job_id: None, step: Some(9), last_increments: None }, None).unwrap_err();
         assert_eq!((step.code, step.valid.as_slice()), ("UNKNOWN_STEP", &["1".to_string()][..]));
     }
 }

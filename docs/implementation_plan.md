@@ -124,3 +124,10 @@ Migrating the CLI/TUI to `FrdIndex`, fixing `increment_number`/`description`, re
 - Facts correction: `lavffcyc.sta` and `beam_benchmark.sta` are not header-only; each has one linear row.
 - Remaining for the adapter: `ccx_solve`, `ccx_job_status`, `ccx_job_cancel` (MCP_SPEC §3), feeding `running`, exit status and stdout into `ccx_diagnose`. Before that: fix the `consolidate_inp` issues listed above.
 - Remaining elsewhere: step 3 (`--json` on the CLI), step 6 (CGX command channel), FRD follow-ups (PSTEP/PHID/PMODE metadata, PDISP, STRESSI), duplicate set ids.
+
+### 2026-11-16 — solver job tools (final entry of this session)
+
+- `ccx_solve`, `ccx_job_status`, `ccx_job_cancel` implemented in `calculix-mcp` (`jobs.rs`, `ccx_tools.rs`); `ccx_diagnose` accepts `job_id` and then uses the job's running state, exit status and solver output. Server flags `--ccx NAME=PATH` and `--env-passthrough NAME`. The server now has 10 tools.
+- Tested: 4 process tests with a fake solver (success / exit code / solver-reported failure, cancellation of a group whose members ignore SIGTERM, timeout + queue + shutdown, reaper with PID-reuse guard), and a real MUMPS solve of a one-element cube through the server over stdio (`crates/calculix-mcp/tests/smoke/drive.py`), including a client disconnect that kills a hanging solver.
+- Decisions and their reasons are recorded in `docs/HANDOFF.md` ("Decisions taken in the job tools"), together with one brief per remaining task. Continue from that file.
+- Roadmap status: step 1 done, step 2 done, step 4 done, step 5 done (first version), step 3 (`--json`) and step 6 (CGX channel) open as HANDOFF tasks 5 and 7.
