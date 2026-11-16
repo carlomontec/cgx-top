@@ -59,6 +59,18 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
+    /// Current byte offset from the start of the buffer
+    #[inline]
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Move the cursor to an absolute byte offset (clamped to the buffer length)
+    #[inline]
+    pub fn seek(&mut self, pos: usize) {
+        self.pos = pos.min(self.data.len());
+    }
+
     /// Rewind the cursor back by a number of bytes
     pub fn rewind(&mut self, bytes: usize) {
         self.pos = self.pos.saturating_sub(bytes);

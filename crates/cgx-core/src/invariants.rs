@@ -335,6 +335,109 @@ impl FrdModel {
     }
 }
 
+impl crate::parser::DenseDataset {
+    /// Stress invariant extrema over the dataset, optionally restricted to `filter_nodes`.
+    /// Same quantities as `compute_dataset_stress_invariants`. Ties keep the first node in file order.
+    pub fn stress_extrema(&self, filter_nodes: Option<&HashSet<u32>>) -> Option<StressExtremaSummary> {
+        let n = self.node_ids.len();
+        let full = |names: &[&str]| self.column(names).filter(|c| c.len() == n);
+        let xx = full(&["SXX", "XX", "S11", "11"])?;
+        let yy = full(&["SYY", "YY", "S22", "22"])?;
+        let zz = full(&["SZZ", "ZZ", "S33", "33"])?;
+        let xy = full(&["SXY", "XY", "S12", "12"])?;
+        let yz = full(&["SYZ", "YZ", "S23", "23"])?;
+        let zx = full(&["SZX", "ZX", "S31", "31", "S13", "13"])?;
+
+        let mut max_vm = (-f32::INFINITY, 0);
+        let mut min_vm = (f32::INFINITY, 0);
+        let mut max_s1 = (-f32::INFINITY, 0);
+        let mut min_s3 = (f32::INFINITY, 0);
+        let mut max_tresca = (-f32::INFINITY, 0);
+        let mut max_hydro = (-f32::INFINITY, 0);
+        let mut node_count = 0usize;
+
+        for (i, &nid) in self.node_ids.iter().enumerate() {
+            if filter_nodes.is_some_and(|f| !f.contains(&nid)) {
+                continue;
+            }
+            node_count += 1;
+            let tensor = StressTensor::new(xx[i], yy[i], zz[i], xy[i], yz[i], zx[i]);
+            let vm = tensor.von_mises();
+            let (s1, _, s3) = tensor.principal_stresses();
+            let tresca = (s1 - s3) * 0.5;
+            let hydro = tensor.hydrostatic();
+            if vm > max_vm.0 { max_vm = (vm, nid); }
+            if vm < min_vm.0 { min_vm = (vm, nid); }
+            if s1 > max_s1.0 { max_s1 = (s1, nid); }
+            if s3 < min_s3.0 { min_s3 = (s3, nid); }
+            if tresca > max_tresca.0 { max_tresca = (tresca, nid); }
+            if hydro > max_hydro.0 { max_hydro = (hydro, nid); }
+        }
+
+        if node_count == 0 {
+            return None;
+        }
+        Some(StressExtremaSummary {
+            step_number: self.step_number,
+            increment_number: 1,
+            value: self.value,
+            max_von_mises: max_vm,
+            min_von_mises: min_vm,
+            max_principal_s1: max_s1,
+            min_principal_s3: min_s3,
+            max_tresca,
+            max_hydrostatic: max_hydro,
+            node_count,
+        })
+    }
+
+    /// Displacement magnitude extrema, optionally restricted to `filter_nodes`.
+    /// Same quantities as `compute_dataset_disp_invariants`.
+    pub fn disp_extrema(&self, filter_nodes: Option<&HashSet<u32>>) -> Option<DispExtremaSummary> {
+        let n = self.node_ids.len();
+        let full = |names: &[&str]| self.column(names).filter(|c| c.len() == n && n > 0);
+        let all = full(&["ALL", "MAG", "TOTAL"]);
+        let xyz = match all {
+            Some(_) => None,
+            None => Some((
+                full(&["D1", "X", "DX", "U1"])?,
+                full(&["D2", "Y", "DY", "U2"])?,
+                full(&["D3", "Z", "DZ", "U3"])?,
+            )),
+        };
+
+        let mut max_disp = (-f32::INFINITY, 0);
+        let mut min_disp = (f32::INFINITY, 0);
+        let mut node_count = 0usize;
+
+        for (i, &nid) in self.node_ids.iter().enumerate() {
+            if filter_nodes.is_some_and(|f| !f.contains(&nid)) {
+                continue;
+            }
+            node_count += 1;
+            let d = match (all, xyz) {
+                (Some(a), _) => a[i],
+                (None, Some((x, y, z))) => displacement_magnitude(x[i], y[i], z[i]),
+                (None, None) => return None,
+            };
+            if d > max_disp.0 { max_disp = (d, nid); }
+            if d < min_disp.0 { min_disp = (d, nid); }
+        }
+
+        if node_count == 0 {
+            return None;
+        }
+        Some(DispExtremaSummary {
+            step_number: self.step_number,
+            increment_number: 1,
+            value: self.value,
+            max_disp,
+            min_disp,
+            node_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

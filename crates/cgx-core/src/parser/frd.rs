@@ -9,13 +9,13 @@ use std::collections::{HashMap, HashSet};
 
 /// Helper to check if a byte slice is empty or only whitespace
 #[inline]
-fn is_blank(bytes: &[u8]) -> bool {
+pub(super) fn is_blank(bytes: &[u8]) -> bool {
     bytes.iter().all(|b| b.is_ascii_whitespace())
 }
 
 /// Helper to parse an integer from a byte slice with leading/trailing spaces
 #[inline]
-fn parse_int<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
+pub(super) fn parse_int<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
     let s = std::str::from_utf8(bytes).ok()?.trim();
     if s.is_empty() {
         return None;
@@ -25,7 +25,7 @@ fn parse_int<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
 
 /// Helper to parse a float from a byte slice with leading/trailing spaces
 #[inline]
-fn parse_float(bytes: &[u8]) -> Option<f32> {
+pub(super) fn parse_float(bytes: &[u8]) -> Option<f32> {
     let s = std::str::from_utf8(bytes).ok()?.trim();
     if s.is_empty() {
         return None;
@@ -35,7 +35,7 @@ fn parse_float(bytes: &[u8]) -> Option<f32> {
 
 /// Helper to safely slice bytes with bounds checking
 #[inline]
-fn slice_safe(line: &[u8], start: usize, end: usize) -> &[u8] {
+pub(super) fn slice_safe(line: &[u8], start: usize, end: usize) -> &[u8] {
     let len = line.len();
     if start >= len {
         b""
@@ -46,7 +46,7 @@ fn slice_safe(line: &[u8], start: usize, end: usize) -> &[u8] {
 }
 
 /// Generate default component names when -5 record is omitted in FRD
-fn default_component_names(field: &str, ncomps: usize) -> Vec<String> {
+pub(super) fn default_component_names(field: &str, ncomps: usize) -> Vec<String> {
     let upper = field.to_uppercase();
     if upper == "DISP" {
         if ncomps == 4 {
@@ -66,7 +66,7 @@ fn default_component_names(field: &str, ncomps: usize) -> Vec<String> {
 
 /// High-performance hybrid ASCII and Binary FRD parser
 pub struct FrdParserEngine<'a> {
-    cursor: ByteCursor<'a>,
+    pub(super) cursor: ByteCursor<'a>,
 }
 
 impl<'a> FrdParserEngine<'a> {
@@ -122,7 +122,7 @@ impl<'a> FrdParserEngine<'a> {
     }
 
     /// Parse Node definitions (`2C` ... )
-    fn parse_nodes_block(&mut self, header_line: &[u8]) -> Result<Vec<Node>> {
+    pub(super) fn parse_nodes_block(&mut self, header_line: &[u8]) -> Result<Vec<Node>> {
         let nod_data: usize = parse_int(slice_safe(header_line, 24, 36)).unwrap_or(0);
         let format_flag: usize = if header_line.len() > 73 {
             parse_int(slice_safe(header_line, 73, 75)).unwrap_or(0)
@@ -201,7 +201,7 @@ impl<'a> FrdParserEngine<'a> {
     }
 
     /// Parse Element definitions (`3C` ... )
-    fn parse_elements_block(&mut self, header_line: &[u8]) -> Result<Vec<Element>> {
+    pub(super) fn parse_elements_block(&mut self, header_line: &[u8]) -> Result<Vec<Element>> {
         let elem_data: usize = parse_int(slice_safe(header_line, 24, 36)).unwrap_or(0);
         let format_flag: usize = if header_line.len() > 73 {
             parse_int(slice_safe(header_line, 73, 75)).unwrap_or(0)

@@ -8,7 +8,7 @@ pub use model::*;
 pub use invariants::*;
 pub use parser::{
     consolidate_inp, inspect_inp, load_companion_sets, parse_frd_file, parse_sets_from_inp,
-    parse_sets_from_str, ByteCursor, FrdParserEngine, InpConsolidateStats, InpInclude, InpSummary,
+    parse_sets_from_str, ByteCursor, DatasetEntry, DenseDataset, FrdIndex, FrdParserEngine, StepRef, InpConsolidateStats, InpInclude, InpSummary,
 };
 
 use thiserror::Error;
