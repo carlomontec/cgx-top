@@ -131,3 +131,20 @@ Migrating the CLI/TUI to `FrdIndex`, fixing `increment_number`/`description`, re
 - Tested: 4 process tests with a fake solver (success / exit code / solver-reported failure, cancellation of a group whose members ignore SIGTERM, timeout + queue + shutdown, reaper with PID-reuse guard), and a real MUMPS solve of a one-element cube through the server over stdio (`crates/calculix-mcp/tests/smoke/drive.py`), including a client disconnect that kills a hanging solver.
 - Decisions and their reasons are recorded in `docs/HANDOFF.md` ("Decisions taken in the job tools"), together with one brief per remaining task. Continue from that file.
 - Roadmap status: step 1 done, step 2 done, step 4 done, step 5 done (first version), step 3 (`--json`) and step 6 (CGX channel) open as HANDOFF tasks 5 and 7.
+
+### 2026-11-16 (second session) — four delegated tasks integrated (uncommitted)
+
+- HANDOFF task 2 + 4 (Sonnet): consolidation handles diamonds, inlines `INPUT=`, uses `ScanLimits`; `inspect_inp` errors on cycles; set ids de-duplicated at the source. Workaround in `frd_sets` removed.
+- HANDOFF task 3 (Opus): `1PSTEP`/`1PHID`/`1PMODE` parsed; `STRESSI` no longer counted as stress; `pdisp_extrema`; `frd_summary` shows `mode`, `nodal_diameter`, and the deck step number. Histories on `lavffcyc.frd` now take about 0.2 to 0.4 s.
+- HANDOFF task 6 items 1, 2, 4 (Sonnet): thread variables were already correct (ccx's JSON writes a constant `num_threads: 1`, a bug in the MultiSolver fork: `json_set_meta_stats(..., 1)` in `CalculiX.c:1283`, `CalculiXstep.c:1386`); the field is now dropped from `ccx_job_status`. New `ccx_job_list` tool; disk quota with `--max-run-gb`.
+- Integrator additions: `ccx_solve` flattens decks that include files outside their directory and refuses anything outside the roots (`PATH_OUTSIDE_ROOTS`).
+- HANDOFF task 7 (Opus): `docs/CGX_CHANNEL.md`. CGX already reads commands from stdin; `-bg` cannot render; live `hcpy` captures are stale or nearly black (see the reviewer note there). Proposed CGX changes are NOT started: they touch Carlo's CGX repository and need his go-ahead.
+- Open from HANDOFF: task 1 (README, in progress), task 5 (`--json`), task 6 items 3, 5, 6, task 8, task 9. Loose end: `parse_sets_recursive` in `inp.rs` still skips cycles and depth > 10 silently.
+
+### 2026-11-17 — preprocessing foundation, CGX fixes, close of second session
+
+- Preprocessing: `.inp` mesh reader, exterior faces with ccx face numbering (verified against `addimdnodedload.f`), selections (direction, plane, box, cylinder, near, connected patch), mesh checks (parts, free nodes, inverted elements, aspect, volume/mass/CoG per section, undefined or empty set references). MCP tools `mesh_check` and `mesh_select` (13 tools in total). On the rotor: verdict OK, volume 8130.76, mass 2.1547e-5, 3632 exterior faces. The volume and mass are not yet verified by an independent method: HANDOFF task 10.
+- CGX (separate repository, uncommitted there): `hcpy` from the stdin queue captures a complete frame; stdin commands wait for model load; result contours use two-sided ambient-dominant lighting. Details and a suggested commit message are in `docs/HANDOFF.md`.
+- README written (`crates/calculix-mcp/README.md`); it predates the two mesh tools.
+- Note on the record: the "last task" prompt asking for `ccx_solve`/`ccx_job_status`/`ccx_job_cancel` was received a second time at the end of this session. That work was already complete and committed in 638b141, so the session closed with review, handoff update and commit instead.
+- Continue from `docs/HANDOFF.md`: status table first, then tasks 10 to 15 and the open older tasks.

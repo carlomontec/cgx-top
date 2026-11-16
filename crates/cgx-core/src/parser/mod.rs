@@ -5,11 +5,13 @@ pub mod frd;
 pub mod inp;
 pub mod frd_index;
 pub mod inp_cards;
+pub mod inp_mesh;
 
 pub use reader::ByteCursor;
 pub use frd::FrdParserEngine;
 pub use frd_index::{DatasetEntry, DenseDataset, FrdIndex, StepRef};
 pub use inp_cards::*;
+pub use inp_mesh::*;
 pub use inp::{
     consolidate_inp, inspect_inp, parse_sets_from_inp, parse_sets_from_str, load_companion_sets,
     InpConsolidateStats, InpInclude, InpSummary,

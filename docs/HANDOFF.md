@@ -3,6 +3,56 @@
 Date: 2026-11-16. Branch: `feat/frd-lazy-index` (not pushed, not merged to `main`).
 Each task below is a self-contained brief for one work session. Read "Ground rules" and "What exists" first.
 
+## Status (updated 2026-11-17, end of second session)
+
+The briefs for tasks 1 to 9 were written before the second session. Where this table and a brief disagree, the table wins. Tasks 10 to 15 at the end of this file are new.
+
+| Task | State |
+|---|---|
+| 1 README and client setup | **Done.** `crates/calculix-mcp/README.md` + a section in the top-level `README.md`. Needs a refresh for the two mesh tools (13 tools now). Client-registration commands were not run against a live client. |
+| 2 Deck consolidation | **Done**, including flattening in `ccx_solve` for includes outside the deck directory. Loose end: `parse_sets_recursive` in `inp.rs` still skips cycles and depth > 10 silently. |
+| 3 `.frd` step metadata, `STRESSI`, `PDISP` | **Done.** Open: move the `cgx-top` CLI/TUI from `parse_frd_file` to `FrdIndex`; `frd_query_set` does not use the PDISP fallback. |
+| 4 Duplicate set ids | **Done.** |
+| 5 `--json` for the CLI | Open. |
+| 6 Job hardening | Items 1 (threads were already correct), 2 (`ccx_job_list`), 4 (disk quota, `--max-run-gb`) **done**. Open: 3 stall detection, 5 progress notifications, 6 calibration on real cutback/divergence runs. |
+| 7 CGX channel study | **Done:** `docs/CGX_CHANNEL.md`. Follow-up fixes in CGX are done but uncommitted in the CGX repository (see "CGX repository state"). |
+| 8 Portability and packaging | Open. |
+| 9 Refresh `MCP_SPEC.md` | Open. |
+| Preprocessing foundation | **Done:** `.inp` mesh reader (`parser/inp_mesh.rs`), exterior faces and selections (`mesh_faces.rs`), checks (`mesh_check.rs`), MCP tools `mesh_check` and `mesh_select` (`calculix-mcp/src/mesh_tools.rs`). |
+| 10 to 15 | Open, briefs at the end. |
+
+The server has **13 tools**: the 10 listed under "What exists" plus `ccx_job_list`, `mesh_check`, `mesh_select`; and a fourth flag `--max-run-gb`. The "known gap" about thread variables further down is resolved: the variables are right; ccx's JSON writes a constant `num_threads: 1` (`json_set_meta_stats(..., 1)` in the MultiSolver fork, `CalculiX.c:1283`, `CalculiXstep.c:1386`), so `ccx_job_status` drops that field.
+
+### How the second session worked (keep doing this)
+
+One reviewer session delegated each task to a subagent with a brief that named the exact files it may edit, the acceptance tests, and "do not commit". Parallel agents got disjoint file sets. Agents in worktrees first ran `git merge --ff-only <feature branch>` because worktrees are cut from `main`. The reviewer copied results in, ran `cargo test --workspace` and the smoke driver, and looked at real output (and at images, for CGX) before accepting. Two agent claims were wrong and were caught this way: a "correct" snapshot that was nearly black, and a node count asserted from the wrong file.
+
+### CGX repository state (/Users/carlo/code/CalculiX/cgx/CalculiX-CGX-New3D) — uncommitted, Carlo commits
+
+Unstaged changes made in the second session, on top of Carlo's own staged work (`git diff --stat`: 5 files, 72 insertions, 6 deletions):
+
+| File (under `cgx_2.23/src/`) | Change |
+|---|---|
+| `cgx_glut_glfw.c` | `hcpy` arriving on the stdin command queue is deferred and captured after the full frame, just before the buffer swap; queued stdin commands wait until the model has loaded |
+| `setFunktions.c` | the `HCPY` branch calls the deferred path |
+| `cgx.h` | prototype; `RESULT_AMB 0.60`, `RESULT_DIFF 0.40` |
+| `plotFunktions.c` | `resultLightBegin/End`: two-sided, ambient-dominant lighting around the two lit result-contour draws, GL state restored |
+| `cgx.c` | removal of a stray non-code line at line 46 (it is still present in the STAGED version: fix before committing) |
+
+Verified: single `hcpy` after `ds 1 e 4`, `plot fv all` shows the contour (model brightness 0.65 to 0.73 of the matching legend swatch, front and back); plain geometry plots pixel-identical before/after. Proof images in `cgx-top/target/cgx-hcpy/` (not tracked). Suggested commit message:
+
+```
+fix(render): readable result contours and reliable hcpy from the command queue
+
+- hcpy issued through the stdin command queue is captured after the complete
+  frame (including overlays), instead of reading a stale buffer
+- queued stdin commands are held until the initial model load has finished
+- result contour plots use two-sided, ambient-dominant lighting
+  (RESULT_AMB 0.60 / RESULT_DIFF 0.40) so colours match the legend on both
+  faces; plain geometry shading is unchanged
+- remove a stray non-code line in cgx.c
+```
+
 ## Ground rules
 
 - **Never commit or push without Carlo's explicit permission.** Propose a plan before editing code. English only (code, comments, docs).
@@ -123,3 +173,49 @@ In priority order, each with a test using the fake-solver pattern already in `jo
 ## Task 9 — bring `docs/MCP_SPEC.md` in line with the code
 
 The spec predates the implementation. Rewrite it as reference documentation of what exists: protocol facts (rmcp 3.10.0, latest MCP revision 2026-07-28, tested with a 2025-06-18 handshake), the real tool schemas (dump them with a `tools/list` call), `offset`/`limit` paging instead of cursors, no cache, the job model as implemented, and the diagnosis rules as implemented including the subagent's deviations listed in `docs/implementation_plan.md`. Keep section 4's rule table and section 6's security model; delete what was dropped (digest sidecar, `FRD_LOADING`, resources, prompts) or move it to a short "Not implemented" list.
+
+---
+
+# New tasks (written 2026-11-17)
+
+Read `crates/calculix-mcp/src/mesh_tools.rs` and `crates/cgx-core/src/{mesh_faces,mesh_check}.rs` before tasks 10 to 12; they set the pattern (pure geometry in cgx-core, a sync function + DTOs in the MCP crate, a thin `#[tool]` in `server.rs`, structured errors, `stages`-style explanations for empty results, never editing the user's deck).
+
+## Task 10 — verify the mesh numbers independently (do this before building on them)
+
+`mesh_check` on the rotor reports volume 8130.76, mass 2.1547e-5 (density 2.65e-9), centre of gravity (-10.9465, 1.2560, 18.7532). These come from one method (element-wise divergence theorem on corner nodes) and were only sanity-checked for plausibility. Add independent tests in `crates/cgx-core/tests/mesh_check.rs`:
+- **Closed-surface identity:** for any mesh, the area-weighted sum of exterior face normals is ~0 (relative to total area); assert on the test blocks and on the rotor (print the residual).
+- **Volume by surface integral:** V = (1/3) sum over exterior faces of area x (centroid . normal), triangulating quads; must equal the element-sum volume within 1e-9 relative on planar-faced test meshes and within about 1 % on the rotor (curved quadratic faces). If the rotor differs more, find out which method is off and report.
+- A cylinder-like mesh of C3D20 with known analytic volume, to quantify the corner-node approximation; put the measured error in the `mesh_check` note.
+Also add a tool-level test that an inverted element makes `mesh_check` return REVIEW.
+
+## Task 11 — `mesh_contact_pairs` (group B of the preprocessing examples)
+
+**Goal:** "Which parts are within 0.1 mm of each other?" and "define contact between the blade root and the disc slot".
+**Core (`cgx-core/src/mesh_contact.rs`):** group exterior faces by a caller-chosen partition (by element set, by connected component from `components()`, or by `*SOLID SECTION` material). For each pair of groups find face pairs whose centroids are within `gap_max` and whose normals oppose (angle between n1 and -n2 below `max_angle_deg`, default 30). Use a uniform grid over face centroids (cell size = gap_max + typical face size) so it is not O(n²). Report per group pair: face counts on each side, areas, min/mean gap (signed along the normal: negative = penetration), and the two face lists.
+**Tool:** input `path`, `partition: "elset" | "component" | "material"`, optional `groups` filter, `gap_max`, `max_angle_deg`, `save: { prefix, overwrite }` writing `<prefix>_<A>_<B>_master.sur` / `_slave.sur`; output a Table of candidate pairs and, when saved, the ready-to-paste `*INCLUDE` lines plus a commented template of `*SURFACE INTERACTION` / `*CONTACT PAIR` cards (as text in the response, never written into the deck). State in the description that master/slave assignment is a suggestion (coarser mesh as master).
+**Tests:** two blocks separated by a gap of 0.05; overlapping blocks (negative gap); blocks sharing nodes (one component: no pair when partition=component); perpendicular faces excluded; grid result equals brute force on a random small case.
+
+## Task 12 — `inp_edit` (group D): located, reviewable deck edits
+
+**Goal:** "request 12 modes", "add a second step with twice the speed", "output stresses only on set BLADE" without free-form rewriting of a 74,000-line deck.
+**Design:** operations address cards through `scan_cards` (`InpCard.file`, `line`, `data_offset`, `data_lines`): `set_param { card: {keyword, step?, index?}, param, value|null }`, `replace_data { card, lines: [..] }`, `insert_after { card, text }`, `delete_card { card }`, `append_step { text }`. Every call writes a NEW root deck (`output_path`, default `<stem>_edit.inp`), never the original; if the edited card lives in an include file, that file is copied alongside with a new name and the `*INCLUDE` line is retargeted. Refuse ambiguous addresses (more than one match without `index`) with the candidates in `valid`. The response returns a unified diff (cap 200 lines) and the result of re-running `scan_cards` on the output (census delta, flags) so the model can confirm the edit did what it intended. `dry_run: true` returns the diff without writing.
+**Tests:** each operation on a temp deck; card inside an include; ambiguous address; `\r\n` decks keep their line endings; output re-parses; original files' bytes unchanged (hash before/after).
+
+## Task 13 — `cgx_run_batch` (group E): geometry and meshing through `cgx -bg`
+
+`-bg` executes a `.fbd` headlessly and works for everything except images (see `docs/CGX_CHANNEL.md` section 3). Reuse `jobs.rs` (process group, timeout, cleared environment, private HOME: this also keeps `~/.cgx` with `ALLOW_SYS` from applying). New flag `--cgx PATH`; without it the tool returns `TOOL_DISABLED`.
+**Tool:** input `script_path` (`.fbd`/`.fbl` inside the roots) or `script` (inline text, max 64 KiB), `timeout_s` (default 300). The script and every file it `read`s (depth 8) are scanned and rejected if any line's first token is `sys` (case-insensitive), or if a `send`/`read`/`hcpy` target is an absolute path or contains `..`; say plainly in the description that this is a mitigation, not a sandbox. Runs in a fresh run directory containing a copy of the script (and of the files it reads); output: exit code, elapsed, list of new files with sizes, counts parsed from them when they are meshes (`read_inp_mesh` on `*.msh`/`*.inp`), and a 4 KiB tail of CGX output. Add `resources/cgx_cheatsheet.md` (shipped via `include_str!` and returned by a `cgx_help` tool or in the tool description if short): the 30 or so commands needed for parametric geometry (`pnt`, `line`, `lcmb`, `surf`, `body`, `seta`, `swep`, `elty`, `div`, `mesh`, `send`, `tra`, `rot`, `copy`, `comp`), each with one verified example. Verify every example by running it.
+**Tests:** fake cgx script for the process side; scanner unit tests; one `#[ignore]` test with the real binary building and meshing a block, then `mesh_check` on the result returns OK.
+
+## Task 14 — `cgx_snapshot`: contour images through the stdin channel
+
+Depends on the uncommitted CGX fixes above being built into the `--cgx` binary. CGX has no offscreen mode: a window appears for a moment; say so in the tool description.
+**Flow:** spawn `cgx_glfw <file>.frd` as a job (process group, timeout 60 s, cwd = run directory holding a copy or symlink of the `.frd`); write to its stdin: optional view commands, `ds <dataset> e <entity>`, `plot fv all`, `hcpy png shot`, `quit`; wait for exit; return the PNG as an MCP image content block plus a `resource_link`, and the legend text (dataset, entity, min, max) parsed from CGX output.
+**Input:** `frd_path`, `dataset` (1-based index as in CGX; map from `frd_summary`'s idx and document the mapping after checking it on `lavffcyc.frd`, where blocks per step differ), `entity`, `view: "iso" | "+x" | "-x" | "+y" | "-y" | "+z" | "-z"` (find the matching `rot` commands in `cgx.c`; `rot u 180` was verified to show the back), `width`/`height` if CGX supports a window size option.
+**Known limits to handle:** stdin lines over 511 characters are dropped; at most 64 queued commands; CGX output is fully buffered when piped (only available after exit); commands return no status, so validate dataset/entity against `FrdIndex` before launching. Only whitelisted commands are ever sent: the tool composes them, the model never passes raw CGX text.
+**Tests:** command composition unit tests; `#[ignore]` test with the real binary on `beam_modal.frd` asserting a PNG of plausible size whose viewport contains more than N non-background pixels (reuse the idea of `target/cgx-hcpy/ratio.py`).
+
+## Task 15 — CGX: model drawn as an empty black outline right after loading
+
+In the CGX repository (rules: `/Users/carlo/code/CalculiX/AGENTS.md`; plan first, never commit, no state-changing git). Right after `cgx_glfw file.frd`, before any `plot` command, the model appears as a black outline: the faces are drawn black (`target/cgx-hcpy/start.png` in cgx-top). The second-session agent traced the neighbouring code: before `plot` the VBO/GLSL path (`cgx_vbo_render_*`, called from `DrawGraficLoad`) draws the frames; after `plot fv` the legacy `DrawPickedItems` → `drawSets` → `drawFaces_plot` path draws. Two known defects nearby: the fragment shader ignores `u_min_scalar`/`u_max_scalar` and clamps the raw scalar to 0..1, and `plotFunktions.c:49` declares `extern double lmodel_twoside[1]` while `cgx.c` defines a `GLfloat`.
+**Do:** find why the initial geometry view has black faces (material/colour state at the first frames, lighting not yet configured, or the shader path writing black); fix minimally; keep `plot f all` / `plot e all` captures pixel-identical to today's (they are correct), and keep the result-contour brightness measured above. Use the stdin channel + `hcpy` for before/after captures, as in `target/cgx-hcpy/` (`( echo "hcpy png start"; sleep 2; echo quit ) | timeout 40 cgx_glfw beam_modal.frd`). Ask Carlo first whether the black start view is what he sees interactively.

@@ -8,6 +8,7 @@ mod error;
 mod frd_tools;
 mod inp_tools;
 mod jobs;
+mod mesh_tools;
 mod paths;
 mod server;
 
@@ -29,6 +30,10 @@ struct Args {
     /// Environment variable to pass through to the solver (e.g. DYLD_LIBRARY_PATH). Repeatable
     #[arg(long = "env-passthrough", value_name = "NAME")]
     env_passthrough: Vec<String>,
+
+    /// Largest size in GiB a job's run directory may reach before the job is killed with DISK_QUOTA
+    #[arg(long = "max-run-gb", value_name = "GIB", default_value_t = 50.0)]
+    max_run_gb: f64,
 }
 
 /// Parse and validate `--ccx name=path`: the binary must exist; it is stored canonicalised.
@@ -68,7 +73,10 @@ async fn main() -> anyhow::Result<()> {
 
     let solvers = parse_solvers(&args.ccx)?;
     eprintln!("solvers: {}", if solvers.is_empty() { "none (ccx_solve disabled; pass --ccx NAME=PATH)".into() } else { solvers.iter().map(|s| s.0.as_str()).collect::<Vec<_>>().join(", ") });
-    let jobs = jobs::JobManager::new(roots.first(), solvers, args.env_passthrough, std::time::Duration::from_secs(5));
+    anyhow::ensure!(args.max_run_gb.is_finite() && args.max_run_gb > 0.0, "--max-run-gb must be a positive number");
+    let max_run_bytes = (args.max_run_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    let jobs = jobs::JobManager::new(roots.first(), solvers, args.env_passthrough, std::time::Duration::from_secs(5))
+        .with_disk_limit(max_run_bytes, std::time::Duration::from_secs(10));
 
     let service = server::CalculixServer::new(roots, jobs.clone()).serve(rmcp::transport::stdio()).await?;
     // Stop on client disconnect (stdin EOF) or a termination signal; never leave a solver behind.

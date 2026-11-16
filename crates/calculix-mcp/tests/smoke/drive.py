@@ -49,6 +49,7 @@ if st["state"] == "SUCCEEDED":
     show("summary:", s.call("frd_summary", path=frd)[1], 900)
     show("query NTOP:", s.call("frd_query_set", path=frd, set="NTOP", inp_path="cube.inp", quantity="displacement", top_n=2)[1], 700)
 print("original deck dir untouched:", sorted(os.listdir("target/mcp-solve/cube")), "\n")
+show("job list:", s.call("ccx_job_list", limit=5)[1])
 show("cancel finished job:", s.call("ccx_job_cancel", job_id=jid)[1])
 show("unknown job:", s.call("ccx_job_status", job_id="j0-dead")[1])
 s.p.stdin.close(); s.p.wait(timeout=20)

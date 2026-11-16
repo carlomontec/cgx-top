@@ -20,6 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
 
 pub const MAX_QUEUE: usize = 8;
+/// Default ceiling for the size of one run directory.
+pub const DEFAULT_MAX_RUN_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// How often a running job's directory is measured.
+const QUOTA_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -62,7 +66,7 @@ pub struct Manifest {
     pub ended: Option<u64>,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
-    /// SPAWN | EXIT_CODE | SIGNAL | SOLVER_REPORTED, with detail
+    /// SPAWN | EXIT_CODE | SIGNAL | SOLVER_REPORTED | TIMEOUT | DISK_QUOTA | LOST, with detail
     pub failure: Option<String>,
 }
 
@@ -132,6 +136,23 @@ pub fn alive(_pid: u32) -> bool {
     false
 }
 
+/// Total size in bytes of the regular files under `dir` (symlinks are not followed).
+pub fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let Ok(md) = std::fs::symlink_metadata(entry.path()) else { continue };
+            if md.is_dir() {
+                pending.push(entry.path());
+            } else if md.is_file() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
 /// Start time of a process as an opaque string (`ps -o lstart=`); None if it does not exist.
 pub fn proc_start(pid: u32) -> Option<String> {
     let out = std::process::Command::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]).output().ok()?;
@@ -180,6 +201,7 @@ impl Job {
 }
 
 /// A deck already copied into its run directory, ready to start.
+#[derive(Debug)]
 pub struct Prepared {
     pub job_id: String,
     pub run_dir: PathBuf,
@@ -197,6 +219,8 @@ struct Inner {
     solvers: Vec<(String, PathBuf)>,
     env_passthrough: Vec<String>,
     grace: Duration,
+    max_run_bytes: u64,
+    quota_interval: Duration,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     slot: Arc<Semaphore>,
 }
@@ -212,11 +236,21 @@ impl JobManager {
             solvers,
             env_passthrough,
             grace,
+            max_run_bytes: DEFAULT_MAX_RUN_BYTES,
+            quota_interval: QUOTA_INTERVAL,
             jobs: Mutex::new(HashMap::new()),
             slot: Arc::new(Semaphore::new(1)),
         }));
         manager.reap();
         manager
+    }
+
+    /// Set the run-directory size limit and how often it is checked. Call right after `new`.
+    pub fn with_disk_limit(mut self, max_run_bytes: u64, interval: Duration) -> Self {
+        let inner = Arc::get_mut(&mut self.0).expect("with_disk_limit is called before the manager is shared");
+        inner.max_run_bytes = max_run_bytes;
+        inner.quota_interval = interval;
+        self
     }
 
     pub fn solver_names(&self) -> Vec<String> {
@@ -311,6 +345,27 @@ impl JobManager {
         })
     }
 
+    /// Every job with a manifest on disk (live ones from memory), newest first, optionally only
+    /// those in `state`. Returns the page of `offset..offset+limit` and the total that matched.
+    pub fn list(&self, state: Option<State>, offset: usize, limit: usize) -> (Vec<Manifest>, usize) {
+        let mut all: Vec<Manifest> = std::fs::read_dir(&self.0.runs_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let id = e.file_name().into_string().ok()?;
+                match self.live(&id) {
+                    Some(job) => Some(job.snapshot()),
+                    None => read_manifest(&e.path()),
+                }
+            })
+            .filter(|m| state.is_none_or(|s| m.state == s))
+            .collect();
+        all.sort_by(|a, b| (b.created, &b.job_id).cmp(&(a.created, &a.job_id)));
+        let total = all.len();
+        (all.into_iter().skip(offset).take(limit).collect(), total)
+    }
+
     /// Wait until the job leaves the state it is in now, or `wait` elapses.
     pub async fn wait_change(&self, id: &str, wait: Duration) {
         if let Some(job) = self.live(id) {
@@ -373,6 +428,20 @@ enum Outcome {
     Exited(std::io::Result<std::process::ExitStatus>),
     Cancelled,
     TimedOut,
+    /// The run directory grew past the limit: (measured bytes, limit bytes)
+    DiskQuota(u64, u64),
+}
+
+/// Resolves when `dir` is larger than `limit` bytes, checking every `interval`.
+async fn over_quota(dir: PathBuf, limit: u64, interval: Duration) -> (u64, u64) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let d = dir.clone();
+        let size = tokio::task::spawn_blocking(move || dir_size(&d)).await.unwrap_or(0);
+        if size > limit {
+            return (size, limit);
+        }
+    }
 }
 
 async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
@@ -411,6 +480,10 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
         .env("TEMP", &tmp)
         .env("LANG", "C")
         .env("LC_ALL", "C")
+        // MultiSolver reads the thread count from the environment only (src/nonlingeo.c,
+        // mafillsmmain.c, mumps.c, ...): a CCX_NPROC_* variable wins for its stage, otherwise
+        // OMP_NUM_THREADS applies, always capped at the detected CPU count. The linear solver
+        // itself is fixed by the binary and the deck's `SOLVER=` parameter, not by the environment.
         .env("OMP_NUM_THREADS", &threads)
         .env("CCX_NPROC_EQUATION_SOLVER", &threads)
         .env("CCX_NPROC_STIFFNESS", &threads)
@@ -446,6 +519,7 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
         status = child.wait() => Outcome::Exited(status),
         _ = cancel.wait_for(|c| *c) => Outcome::Cancelled,
         _ = tokio::time::sleep(Duration::from_secs(m.timeout_s)) => Outcome::TimedOut,
+        (size, limit) = over_quota(m.run_dir.clone(), inner.max_run_bytes, inner.quota_interval) => Outcome::DiskQuota(size, limit),
     };
 
     match outcome {
@@ -455,7 +529,7 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
             let (state, code, signal, failure) = classify(status, &m);
             job.finish(state, code, signal, failure);
         }
-        Outcome::Cancelled | Outcome::TimedOut => {
+        Outcome::Cancelled | Outcome::TimedOut | Outcome::DiskQuota(..) => {
             job.update(|m| m.state = State::Cancelling);
             signal_group(pid, TERM);
             #[cfg(not(unix))]
@@ -473,6 +547,12 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
             let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
             match outcome {
                 Outcome::TimedOut => job.finish(State::TimedOut, code, signal, Some(format!("TIMEOUT: exceeded {} s", m.timeout_s))),
+                Outcome::DiskQuota(size, limit) => job.finish(
+                    State::Failed,
+                    code,
+                    signal,
+                    Some(format!("DISK_QUOTA: run directory reached {} MiB, limit {} MiB", size >> 20, limit >> 20)),
+                ),
                 _ => job.finish(State::Cancelled, code, signal, None),
             }
         }
@@ -527,6 +607,7 @@ case "$mode" in
   bad)  echo '{"meta":{"success":false},"steps":[{"step_number":1,"converged":false}]}' > "$job.json"; exit 0 ;;
   fail) echo " *ERROR in fake: boom"; exit 201 ;;
   hang) sleep 300 ;;
+  flood) while :; do head -c 65536 /dev/zero >> flood.bin; sleep 0.02; done ;;
   stubborn) (trap '' TERM; exec sleep 300) & echo $! > child.pid; trap '' TERM; wait ;;
 esac
 "#;
@@ -650,6 +731,47 @@ esac
         assert_eq!(b.manager.get(&third).unwrap().state, State::Cancelled, "queued job cancelled without starting");
         assert!(b.manager.get(&third).unwrap().pid.is_none());
         assert!(gone(second.pid.unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn disk_quota_kills_the_job_and_fails_it() {
+        let mut b = bench("quota");
+        let solver = b.dir.join("fake_ccx");
+        b.manager = JobManager::new(&b.dir, vec![("fake".into(), solver)], Vec::new(), Duration::from_millis(400))
+            .with_disk_limit(200 * 1024, Duration::from_millis(100));
+        // A job that stays small is left alone.
+        let small = b.until(&b.start("ok", 30), State::terminal).await;
+        assert_eq!(small.state, State::Succeeded);
+
+        let id = b.start("flood", 60);
+        let m = b.until(&id, State::terminal).await;
+        assert_eq!(m.state, State::Failed);
+        assert!(m.failure.as_deref().unwrap().starts_with("DISK_QUOTA:"), "{:?}", m.failure);
+        assert!(m.signal.is_some(), "the group was terminated");
+        assert!(gone(m.pid.unwrap()).await);
+        assert!(dir_size(&m.run_dir) > 200 * 1024);
+    }
+
+    #[tokio::test]
+    async fn list_is_newest_first_filtered_and_paged() {
+        let b = bench("list");
+        let ok = b.start("ok", 30);
+        b.until(&ok, State::terminal).await;
+        let fail = b.start("fail", 30);
+        b.until(&fail, State::terminal).await;
+        // Backdate the first job, as if a previous server run had produced it.
+        let mut old = b.manager.get(&ok).unwrap();
+        old.created -= 100;
+        write_manifest(&old);
+
+        let fresh = JobManager::new(&b.dir, Vec::new(), Vec::new(), Duration::from_millis(100));
+        let (all, total) = fresh.list(None, 0, 10);
+        assert_eq!((total, all.iter().map(|m| m.job_id.as_str()).collect::<Vec<_>>()), (2, vec![fail.as_str(), ok.as_str()]));
+        let (failed, n) = fresh.list(Some(State::Failed), 0, 10);
+        assert_eq!((n, failed[0].job_id.as_str()), (1, fail.as_str()));
+        let (page, n) = fresh.list(None, 1, 1);
+        assert_eq!((n, page.len(), page[0].job_id.as_str()), (2, 1, ok.as_str()));
+        assert_eq!(fresh.list(Some(State::Running), 0, 10).1, 0);
     }
 
     #[tokio::test]

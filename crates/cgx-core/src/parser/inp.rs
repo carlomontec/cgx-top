@@ -1,6 +1,7 @@
 //! Parser, consolidator, and inspection engine for CalculiX / Abaqus `.inp` and `.nam` decks.
 
-use crate::model::{Set, SetType};
+use crate::parser::inp_cards::ScanLimits;
+use crate::model::{merge_set_into, Set, SetType};
 use crate::{FrdError, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -72,7 +73,118 @@ pub fn parse_include_target(line: &str) -> Option<String> {
     None
 }
 
+/// Resource accounting shared by the recursive walkers, enforcing [`ScanLimits`].
+struct Budget {
+    limits: ScanLimits,
+    files_opened: usize,
+    total_bytes: u64,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Budget {
+            limits: ScanLimits::default(),
+            files_opened: 0,
+            total_bytes: 0,
+        }
+    }
+
+    /// Check depth and file-count limits, then account for one more opened file.
+    fn enter(&mut self, path: &Path, depth: usize) -> Result<()> {
+        if depth > self.limits.max_depth {
+            return Err(FrdError::InvalidFormat(format!(
+                "Exceeded maximum *INCLUDE depth ({}) at {}",
+                self.limits.max_depth,
+                path.display()
+            )));
+        }
+        if self.files_opened + 1 > self.limits.max_files {
+            return Err(FrdError::InvalidFormat(format!(
+                "Exceeded maximum number of files ({}) at {}",
+                self.limits.max_files,
+                path.display()
+            )));
+        }
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if self.total_bytes.saturating_add(size) > self.limits.max_total_bytes {
+            return Err(FrdError::InvalidFormat(format!(
+                "Exceeded maximum total bytes ({}) at {}",
+                self.limits.max_total_bytes,
+                path.display()
+            )));
+        }
+        self.files_opened += 1;
+        self.total_bytes += size;
+        Ok(())
+    }
+}
+
+fn circular_error(path: &Path) -> FrdError {
+    FrdError::InvalidFormat(format!("Circular *INCLUDE detected: {}", path.display()))
+}
+
+fn read_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|e| {
+        FrdError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {}", path.display(), e),
+        ))
+    })
+}
+
+fn is_comment_or_blank(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t.starts_with("**")
+}
+
+/// Collect the header starting at `lines[start]` (a `*` card), joining continuation lines
+/// while the text ends with a comma. Returns the joined text and the index after the header.
+fn collect_header(lines: &[&str], start: usize) -> (String, usize) {
+    let mut text = lines[start].trim().to_string();
+    let mut next = start + 1;
+    while text.ends_with(',') && next < lines.len() {
+        let cont = lines[next].trim();
+        next += 1;
+        if is_comment_or_blank(cont) {
+            continue;
+        }
+        text.push(' ');
+        text.push_str(cont);
+    }
+    (text, next)
+}
+
+/// Value of the `INPUT=<file>` parameter of a non-INCLUDE card header, if any, together
+/// with the header re-rendered without that parameter.
+fn split_input_param(header: &str) -> Option<(String, String)> {
+    let upper = header.to_uppercase();
+    if upper.starts_with("*INCLUDE") {
+        return None;
+    }
+    let mut target = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for part in header.split(',') {
+        let p = part.trim();
+        if p.to_uppercase().starts_with("INPUT=") {
+            let val = p[6..].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            if !val.is_empty() && target.is_none() {
+                target = Some(val.to_string());
+                continue;
+            }
+        }
+        if !p.is_empty() {
+            kept.push(p);
+        }
+    }
+    target.map(|t| (kept.join(", "), t))
+}
+
 /// Recursively inline all `*INCLUDE` statements into a single consolidated `.inp` string.
+///
+/// Cards other than `*INCLUDE` carrying `INPUT=<file>` (e.g. `*NODE, INPUT=nodes.inc`) are
+/// inlined too: the header is written without the `INPUT` parameter, followed by the
+/// file's lines. A file included more than once (a diamond) is inlined each time; only a
+/// real cycle is an error. Limits come from [`ScanLimits::default`].
 pub fn consolidate_inp<P: AsRef<Path>>(root_path: P) -> Result<(String, InpConsolidateStats)> {
     let root_path = root_path.as_ref().to_path_buf();
     if !root_path.exists() {
@@ -83,13 +195,22 @@ pub fn consolidate_inp<P: AsRef<Path>>(root_path: P) -> Result<(String, InpConso
     }
 
     let mut output = String::new();
-    let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let mut budget = Budget::new();
     let mut stats = InpConsolidateStats {
         root_file: root_path.clone(),
         ..Default::default()
     };
 
-    consolidate_recursive(&root_path, &root_path, &mut output, &mut visited, &mut stats, 0)?;
+    consolidate_recursive(
+        &root_path,
+        &root_path,
+        &mut output,
+        &mut stack,
+        &mut budget,
+        &mut stats,
+        0,
+    )?;
 
     stats.total_lines_written = output.lines().count();
     Ok((output, stats))
@@ -99,37 +220,56 @@ fn consolidate_recursive(
     current_file: &Path,
     root_file: &Path,
     output: &mut String,
-    visited: &mut HashSet<PathBuf>,
+    stack: &mut Vec<PathBuf>,
+    budget: &mut Budget,
     stats: &mut InpConsolidateStats,
     depth: usize,
 ) -> Result<()> {
-    if depth > 10 {
-        return Err(FrdError::InvalidFormat(format!(
-            "Exceeded maximum *INCLUDE recursion depth (10) at {}",
-            current_file.display()
-        )));
-    }
-
     let canonical = fs::canonicalize(current_file).unwrap_or_else(|_| current_file.to_path_buf());
-    if visited.contains(&canonical) {
-        return Err(FrdError::InvalidFormat(format!(
-            "Circular *INCLUDE detected: {}",
-            current_file.display()
-        )));
+    if stack.contains(&canonical) {
+        return Err(circular_error(current_file));
     }
-    visited.insert(canonical.clone());
+    budget.enter(current_file, depth)?;
+    stack.push(canonical);
+    let result = consolidate_body(current_file, root_file, output, stack, budget, stats, depth);
+    stack.pop();
+    result
+}
 
-    let content = fs::read_to_string(current_file).map_err(|e| {
-        FrdError::Io(std::io::Error::new(
-            e.kind(),
-            format!("Failed to read {}: {}", current_file.display(), e),
-        ))
-    })?;
-
+fn consolidate_body(
+    current_file: &Path,
+    root_file: &Path,
+    output: &mut String,
+    stack: &mut Vec<PathBuf>,
+    budget: &mut Budget,
+    stats: &mut InpConsolidateStats,
+    depth: usize,
+) -> Result<()> {
+    let content = read_file(current_file)?;
+    let lines: Vec<&str> = content.lines().collect();
     let parent_dir = current_file.parent().unwrap_or_else(|| Path::new("."));
+    let root_dir = root_file.parent().unwrap_or_else(|| Path::new("."));
 
-    for line in content.lines() {
-        if let Some(target_rel) = parse_include_target(line) {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if !trimmed.starts_with('*') || trimmed.starts_with("**") {
+            output.push_str(line);
+            output.push('\n');
+            i += 1;
+            continue;
+        }
+
+        let (header, next) = collect_header(&lines, i);
+        let is_include = header.to_uppercase().starts_with("*INCLUDE");
+        let include_target = if is_include {
+            parse_include_target(&header)
+        } else {
+            None
+        };
+
+        if let Some(target_rel) = include_target {
             let target_path = parent_dir.join(&target_rel);
             if !target_path.exists() {
                 return Err(FrdError::NotFound(format!(
@@ -138,9 +278,8 @@ fn consolidate_recursive(
                     current_file.display()
                 )));
             }
-
             let display_name = target_path
-                .strip_prefix(root_file.parent().unwrap_or_else(|| Path::new(".")))
+                .strip_prefix(root_dir)
                 .unwrap_or(&target_path)
                 .display()
                 .to_string();
@@ -151,22 +290,42 @@ fn consolidate_recursive(
                  ** ====================================================================\n",
                 display_name
             ));
-
             stats.total_files_inlined += 1;
             stats.inlined_files.push(target_path.clone());
-
-            consolidate_recursive(&target_path, root_file, output, visited, stats, depth + 1)?;
-
+            consolidate_recursive(&target_path, root_file, output, stack, budget, stats, depth + 1)?;
             output.push_str(&format!(
                 "** ====================================================================\n\
                  ** END INCLUDE: {}\n\
                  ** ====================================================================\n",
                 display_name
             ));
-        } else {
-            output.push_str(line);
+        } else if let Some((bare_header, target_rel)) = split_input_param(&header) {
+            let target_path = parent_dir.join(&target_rel);
+            if !target_path.is_file() {
+                return Err(FrdError::NotFound(format!(
+                    "Input file not found: '{}' (referenced from {})",
+                    target_rel,
+                    current_file.display()
+                )));
+            }
+            budget.enter(&target_path, depth + 1)?;
+            let data = read_file(&target_path)?;
+            stats.total_files_inlined += 1;
+            stats.inlined_files.push(target_path.clone());
+
+            output.push_str(&bare_header);
             output.push('\n');
+            for data_line in data.lines() {
+                output.push_str(data_line);
+                output.push('\n');
+            }
+        } else {
+            for original in &lines[i..next] {
+                output.push_str(original);
+                output.push('\n');
+            }
         }
+        i = next;
     }
 
     Ok(())
@@ -174,6 +333,10 @@ fn consolidate_recursive(
 
 /// Inspect an `.inp` file: discover all included files, check missing dependencies,
 /// and summarize sets, boundary conditions, and steps.
+///
+/// Limits come from [`ScanLimits::default`]; an include cycle or an exceeded limit is an
+/// error. A file included more than once is walked each time (as consolidation would
+/// inline it) but counted once in `total_files_count`.
 pub fn inspect_inp<P: AsRef<Path>>(root_path: P) -> Result<InpSummary> {
     let root_path = root_path.as_ref().to_path_buf();
     let mut summary = InpSummary {
@@ -181,29 +344,43 @@ pub fn inspect_inp<P: AsRef<Path>>(root_path: P) -> Result<InpSummary> {
         ..Default::default()
     };
 
-    let mut visited: HashSet<PathBuf> = HashSet::new();
-    inspect_recursive(&root_path, &mut summary, &mut visited, 0)?;
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut budget = Budget::new();
+    inspect_recursive(&root_path, &mut summary, &mut stack, &mut seen, &mut budget, 0)?;
 
-    summary.total_files_count = visited.len();
+    summary.total_files_count = seen.len();
     Ok(summary)
 }
 
 fn inspect_recursive(
     current_file: &Path,
     summary: &mut InpSummary,
-    visited: &mut HashSet<PathBuf>,
+    stack: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    budget: &mut Budget,
     depth: usize,
 ) -> Result<()> {
-    if depth > 10 {
-        return Ok(());
-    }
-
     let canonical = fs::canonicalize(current_file).unwrap_or_else(|_| current_file.to_path_buf());
-    if visited.contains(&canonical) {
-        return Ok(());
+    if stack.contains(&canonical) {
+        return Err(circular_error(current_file));
     }
-    visited.insert(canonical);
+    budget.enter(current_file, depth)?;
+    seen.insert(canonical.clone());
+    stack.push(canonical);
+    let result = inspect_body(current_file, summary, stack, seen, budget, depth);
+    stack.pop();
+    result
+}
 
+fn inspect_body(
+    current_file: &Path,
+    summary: &mut InpSummary,
+    stack: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    budget: &mut Budget,
+    depth: usize,
+) -> Result<()> {
     let content = match fs::read_to_string(current_file) {
         Ok(c) => c,
         Err(_) => return Ok(()),
@@ -237,7 +414,7 @@ fn inspect_recursive(
             });
 
             if exists {
-                inspect_recursive(&target_path, summary, visited, depth + 1)?;
+                inspect_recursive(&target_path, summary, stack, seen, budget, depth + 1)?;
             }
         } else if trimmed.starts_with('*') && !trimmed.starts_with("**") {
             let upper = trimmed.to_uppercase();
@@ -399,6 +576,9 @@ pub fn parse_sets_from_str(content: &str) -> HashMap<String, Set> {
         &mut sets,
     );
 
+    for set in sets.values_mut() {
+        set.dedup_ids();
+    }
     sets
 }
 
@@ -435,14 +615,7 @@ fn parse_sets_recursive(
 
     let local_sets = parse_sets_from_str(&content);
     for (name, set) in local_sets {
-        let entry = sets.entry(name).or_insert_with(|| Set {
-            name: set.name.clone(),
-            set_type: set.set_type.clone(),
-            node_ids: Vec::new(),
-            element_ids: Vec::new(),
-        });
-        entry.node_ids.extend(set.node_ids);
-        entry.element_ids.extend(set.element_ids);
+        merge_set_into(sets, name, set);
     }
 
     let parent_dir = current_file.parent().unwrap_or_else(|| Path::new("."));
@@ -474,7 +647,9 @@ pub fn load_companion_sets<P: AsRef<Path>>(frd_path: P) -> HashMap<String, Set> 
         let companion_inp = parent_dir.join(format!("{}.inp", stem.to_string_lossy()));
         if companion_inp.exists() {
             if let Ok(inp_sets) = parse_sets_from_inp(&companion_inp) {
-                sets.extend(inp_sets);
+                for (name, set) in inp_sets {
+                    merge_set_into(&mut sets, name, set);
+                }
             }
         }
     }
@@ -486,14 +661,7 @@ pub fn load_companion_sets<P: AsRef<Path>>(frd_path: P) -> HashMap<String, Set> 
             if path.extension().and_then(|s| s.to_str()) == Some("nam") {
                 if let Ok(nam_sets) = parse_sets_from_inp(&path) {
                     for (name, s) in nam_sets {
-                        let entry = sets.entry(name).or_insert_with(|| Set {
-                            name: s.name.clone(),
-                            set_type: s.set_type.clone(),
-                            node_ids: Vec::new(),
-                            element_ids: Vec::new(),
-                        });
-                        entry.node_ids.extend(s.node_ids);
-                        entry.element_ids.extend(s.element_ids);
+                        merge_set_into(&mut sets, name, s);
                     }
                 }
             }

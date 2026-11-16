@@ -436,6 +436,43 @@ impl crate::parser::DenseDataset {
             node_count,
         })
     }
+
+    /// Extrema of `sqrt(MAG1² + MAG2² + MAG3²)` over a complex displacement dataset (`PDISP`),
+    /// optionally restricted to `filter_nodes`.
+    ///
+    /// This is an amplitude bound, not a displacement magnitude: the displacement over one
+    /// period is `u_i(t) = MAG_i cos(wt + PHA_i)`, so `|u(t)|` never exceeds this value and
+    /// reaches it only when the three phases coincide.
+    pub fn pdisp_extrema(&self, filter_nodes: Option<&HashSet<u32>>) -> Option<DispExtremaSummary> {
+        let n = self.node_ids.len();
+        let full = |name: &str| self.column(&[name]).filter(|c| c.len() == n && n > 0);
+        let (m1, m2, m3) = (full("MAG1")?, full("MAG2")?, full("MAG3")?);
+
+        let mut max_disp = (-f32::INFINITY, 0);
+        let mut min_disp = (f32::INFINITY, 0);
+        let mut node_count = 0usize;
+        for (i, &nid) in self.node_ids.iter().enumerate() {
+            if filter_nodes.is_some_and(|f| !f.contains(&nid)) {
+                continue;
+            }
+            node_count += 1;
+            let d = displacement_magnitude(m1[i], m2[i], m3[i]);
+            if d > max_disp.0 { max_disp = (d, nid); }
+            if d < min_disp.0 { min_disp = (d, nid); }
+        }
+
+        if node_count == 0 {
+            return None;
+        }
+        Some(DispExtremaSummary {
+            step_number: self.step_number,
+            increment_number: 1,
+            value: self.value,
+            max_disp,
+            min_disp,
+            node_count,
+        })
+    }
 }
 
 #[cfg(test)]

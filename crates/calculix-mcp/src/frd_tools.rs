@@ -139,6 +139,10 @@ fn open(roots: &Roots, path: &str, inp_path: Option<&str>) -> Result<(FrdIndex, 
 }
 
 /// Entry of `step` holding the primary real dataset called `name`, else the first of `kind`.
+///
+/// Both tests are exact: the name is compared whole, and `field_type` is set only for the
+/// exact names `DISP`, `STRESS`, ... So the imaginary parts `STRESSI`/`ERRORI` and the complex
+/// `PDISP` (all `FieldType::Other`) are never taken for the real field.
 fn primary(index: &FrdIndex, step: &StepRef, name: &str, kind: FieldType) -> Option<usize> {
     let entries = index.entries();
     step.entries
@@ -150,15 +154,48 @@ fn primary(index: &FrdIndex, step: &StepRef, name: &str, kind: FieldType) -> Opt
 
 struct StepExtrema {
     disp: Option<DispExtremaSummary>,
+    /// `disp` is the PDISP amplitude bound, not a DISP magnitude
+    disp_from_pdisp: bool,
     stress: Option<StressExtremaSummary>,
 }
 
-fn step_extrema(index: &FrdIndex, step: &StepRef, filter: Option<&HashSet<u32>>, disp: bool, stress: bool) -> StepExtrema {
-    let load = |name: &str, kind: FieldType| primary(index, step, name, kind).and_then(|e| index.load(e).ok());
+/// Extrema of the primary DISP and STRESS datasets of `step`. With `pdisp_fallback`, a step
+/// that has no DISP dataset uses the amplitude bound of its PDISP dataset for `disp`.
+fn step_extrema(
+    index: &FrdIndex,
+    step: &StepRef,
+    filter: Option<&HashSet<u32>>,
+    disp: bool,
+    stress: bool,
+    pdisp_fallback: bool,
+) -> StepExtrema {
+    let load = |e: Option<usize>| e.and_then(|e| index.load(e).ok());
+    let disp_entry = if disp { primary(index, step, "DISP", FieldType::Displacement) } else { None };
+    let pdisp_entry = if disp && pdisp_fallback && disp_entry.is_none() {
+        step.entries.iter().copied().find(|&e| index.entries()[e].name.eq_ignore_ascii_case("PDISP"))
+    } else {
+        None
+    };
+    let (disp, disp_from_pdisp) = match (disp_entry, pdisp_entry) {
+        (Some(e), _) => (load(Some(e)).and_then(|d| d.disp_extrema(filter)), false),
+        (None, Some(e)) => (load(Some(e)).and_then(|d| d.pdisp_extrema(filter)), true),
+        (None, None) => (None, false),
+    };
     StepExtrema {
-        disp: if disp { load("DISP", FieldType::Displacement).and_then(|d| d.disp_extrema(filter)) } else { None },
-        stress: if stress { load("STRESS", FieldType::Stress).and_then(|d| d.stress_extrema(filter)) } else { None },
+        disp_from_pdisp: disp_from_pdisp && disp.is_some(),
+        disp,
+        stress: if stress {
+            load(primary(index, step, "STRESS", FieldType::Stress)).and_then(|d| d.stress_extrema(filter))
+        } else {
+            None
+        },
     }
+}
+
+/// Step number as in the input deck when the file records it (third field of `1PSTEP`),
+/// otherwise the running block counter of the `100C` header.
+fn deck_step(step: &StepRef) -> u32 {
+    step.pstep.map(|p| p.2).unwrap_or(step.step_number)
 }
 
 /// Track the extreme of one quantity across steps as `[value, node, idx]`.
@@ -219,7 +256,8 @@ pub struct FrdSummaryOut {
     pub sets: usize,
     pub steps_total: usize,
     pub datasets: Vec<DatasetInfo>,
-    /// One row per step: whole-model peak displacement magnitude and von Mises stress with their node ids
+    /// One row per step: whole-model peak displacement magnitude and von Mises stress with their node ids.
+    /// `mode` and `nodal_diameter` columns are present only when the file records them.
     pub steps: Table,
     /// Peaks over ALL selected steps (not only this page) as [value, node, idx]; null if the field is absent
     pub envelope: Map<String, Value>,
@@ -233,7 +271,7 @@ pub fn summary(roots: &Roots, p: FrdSummaryIn) -> Result<FrdSummaryOut, ToolErro
 
     let extrema: Vec<StepExtrema> = chosen
         .par_iter()
-        .map(|&i| step_extrema(&index, &index.steps()[i], None, true, true))
+        .map(|&i| step_extrema(&index, &index.steps()[i], None, true, true, true))
         .collect();
 
     let (mut u_max, mut vm_max) = (Peak::default(), Peak::default());
@@ -241,6 +279,18 @@ pub fn summary(roots: &Roots, p: FrdSummaryIn) -> Result<FrdSummaryOut, ToolErro
         u_max.feed(x.disp.as_ref().map(|d| d.max_disp), i, false);
         vm_max.feed(x.stress.as_ref().map(|s| s.max_von_mises), i, false);
     }
+
+    // Mode and nodal diameter columns only when some step of the file carries them.
+    let has_mode = index.steps().iter().any(|s| s.mode.is_some());
+    let has_nd = index.steps().iter().any(|s| s.nodal_diameter.is_some());
+    let mut columns: Vec<String> = ["idx", "step", "value", "analysis"].map(String::from).to_vec();
+    if has_mode {
+        columns.push("mode".into());
+    }
+    if has_nd {
+        columns.push("nodal_diameter".into());
+    }
+    columns.extend(["u_max", "u_max_node", "vm_max", "vm_max_node"].map(String::from));
 
     let (window, page) = Page::window(chosen.len(), p.offset, p.limit, 20, 200);
     let rows = window
@@ -250,7 +300,15 @@ pub fn summary(roots: &Roots, p: FrdSummaryIn) -> Result<FrdSummaryOut, ToolErro
             let analysis = step.entries.first().map(|&e| index.entries()[e].analysis.clone()).unwrap_or_default();
             let [u, un] = pair(x.disp.as_ref().map(|d| d.max_disp));
             let [vm, vmn] = pair(x.stress.as_ref().map(|s| s.max_von_mises));
-            vec![json!(i), json!(step.step_number), num(step.value), json!(analysis), u, un, vm, vmn]
+            let mut row = vec![json!(i), json!(deck_step(step)), num(step.value), json!(analysis)];
+            if has_mode {
+                row.push(json!(step.mode));
+            }
+            if has_nd {
+                row.push(json!(step.nodal_diameter));
+            }
+            row.extend([u, un, vm, vmn]);
+            row
         })
         .collect();
 
@@ -269,8 +327,13 @@ pub fn summary(roots: &Roots, p: FrdSummaryIn) -> Result<FrdSummaryOut, ToolErro
     }
 
     let mut notes = vec![UNITS_NOTE.to_string()];
-    if datasets.iter().any(|d| d.name.eq_ignore_ascii_case("PDISP")) {
-        notes.push("Displacement of complex/cyclic modes is stored as PDISP (magnitude and phase) and is not included in u_max.".into());
+    let from_pdisp: Vec<String> =
+        chosen.iter().zip(&extrema).filter(|(_, x)| x.disp_from_pdisp).map(|(i, _)| i.to_string()).collect();
+    if !from_pdisp.is_empty() {
+        notes.push(format!(
+            "Steps with idx {} have no DISP dataset; their u_max is sqrt(MAG1^2 + MAG2^2 + MAG3^2) of the complex PDISP dataset (magnitude and phase per component). This is an upper bound of the vector amplitude over one period, reached only where the three phases coincide.",
+            from_pdisp.join(", ")
+        ));
     }
     if index.entries().iter().any(|e| e.analysis.to_uppercase().contains("MODAL")) {
         notes.push("Steps with analysis MODAL hold mode shapes: 'value' is the eigenfrequency, and their displacement and stress amplitudes are normalised, not physical magnitudes.".into());
@@ -288,10 +351,7 @@ pub fn summary(roots: &Roots, p: FrdSummaryIn) -> Result<FrdSummaryOut, ToolErro
         sets: index.mesh().sets.len(),
         steps_total: index.steps().len(),
         datasets,
-        steps: Table {
-            columns: ["idx", "step", "value", "analysis", "u_max", "u_max_node", "vm_max", "vm_max_node"].map(String::from).to_vec(),
-            rows,
-        },
+        steps: Table { columns, rows },
         envelope,
         notes,
         page,
@@ -343,11 +403,7 @@ pub fn sets(roots: &Roots, p: FrdSetsIn) -> Result<FrdSetsOut, ToolError> {
     let (window, page) = Page::window(all.len(), p.offset, p.limit, 50, 200);
     let rows = all[window]
         .iter()
-        .map(|s| {
-            // Count distinct ids: a set defined in both a .nam file and the deck lists them twice.
-            let unique = |ids: &[u32]| ids.iter().collect::<HashSet<_>>().len();
-            vec![json!(s.name), json!(kind_str(&s.set_type)), json!(unique(&s.node_ids)), json!(unique(&s.element_ids))]
-        })
+        .map(|s| vec![json!(s.name), json!(kind_str(&s.set_type)), json!(s.node_ids.len()), json!(s.element_ids.len())])
         .collect();
     Ok(FrdSetsOut {
         sets: Table { columns: ["name", "kind", "nodes", "elements"].map(String::from).to_vec(), rows },
@@ -460,7 +516,7 @@ pub fn query_set(roots: &Roots, p: FrdQueryIn) -> Result<FrdQueryOut, ToolError>
     let chosen = pick_steps(&p.steps, index.steps().len())?;
     let extrema: Vec<StepExtrema> = chosen
         .par_iter()
-        .map(|&i| step_extrema(&index, &index.steps()[i], Some(&ids), !stress, stress))
+        .map(|&i| step_extrema(&index, &index.steps()[i], Some(&ids), !stress, stress, false))
         .collect();
 
     // Envelope over all selected steps.
@@ -485,7 +541,7 @@ pub fn query_set(roots: &Roots, p: FrdQueryIn) -> Result<FrdQueryOut, ToolError>
         .map(|k| {
             let (i, x) = (chosen[k], &extrema[k]);
             let step = &index.steps()[i];
-            let mut row = vec![json!(i), json!(step.step_number), num(step.value)];
+            let mut row = vec![json!(i), json!(deck_step(step)), num(step.value)];
             if stress {
                 let s = x.stress.as_ref();
                 for cell in [
@@ -650,6 +706,8 @@ mod tests {
         let s = summary(&roots, FrdSummaryIn { path: "beam_benchmark.frd".into(), steps: StepSel::default(), offset: 0, limit: None }).unwrap();
         assert_eq!((s.nodes, s.steps_total, s.steps.rows.len()), (38475, 1, 1));
         assert_eq!(s.steps.rows[0].len(), s.steps.columns.len());
+        assert!(!s.steps.columns.iter().any(|c| c == "mode" || c == "nodal_diameter"), "static run has no mode columns");
+        assert!(!s.notes.iter().any(|n| n.contains("PDISP")));
 
         let query = |set: &str, quantity, top_n| FrdQueryIn {
             path: "beam_benchmark.frd".into(), set: set.into(), inp_path: None, quantity,
@@ -675,5 +733,33 @@ mod tests {
         let listed = sets(&roots, FrdSetsIn { path: "beam_benchmark.frd".into(), inp_path: None, filter: Some("nn".into()), offset: 0, limit: None }).unwrap();
         assert_eq!(listed.sets.rows.len(), 2);
         assert_eq!(listed.sets.rows[0][2], json!(161));
+    }
+
+    /// Cyclic symmetry modal run with complex results; skipped when the sample is absent.
+    #[test]
+    fn cyclic_file_summary_has_modes_and_pdisp_amplitude() {
+        let dir = PathBuf::from("/Users/carlo/code/CalculiX/ccx/CalculiX-CrunchiX-MultiSolver/benchmarks/compressor_rotor");
+        if !dir.join("lavffcyc.frd").exists() {
+            eprintln!("Skipping: lavffcyc.frd not found");
+            return;
+        }
+        let roots = Roots::new(vec![dir]).unwrap();
+        let s = summary(&roots, FrdSummaryIn { path: "lavffcyc.frd".into(), steps: StepSel::default(), offset: 0, limit: None }).unwrap();
+        assert_eq!(s.steps_total, 4);
+        let col = |name: &str| s.steps.columns.iter().position(|c| c == name).unwrap_or_else(|| panic!("no column {}", name));
+        let (mode, nd, u, vm) = (col("mode"), col("nodal_diameter"), col("u_max"), col("vm_max"));
+        for (k, row) in s.steps.rows.iter().enumerate() {
+            assert_eq!(row.len(), s.steps.columns.len());
+            assert!(row[u].is_number(), "step idx {} has u_max", k);
+            assert!(row[vm].is_number(), "step idx {} has vm_max", k);
+            if k == 0 {
+                assert_eq!((&row[mode], &row[nd]), (&Value::Null, &Value::Null));
+            } else {
+                assert!(row[mode].is_number());
+                assert_eq!(row[nd], json!(5));
+            }
+        }
+        let note = s.notes.iter().find(|n| n.contains("PDISP")).expect("PDISP note");
+        assert!(note.contains("idx 1, 2, 3") && note.contains("upper bound"), "{}", note);
     }
 }

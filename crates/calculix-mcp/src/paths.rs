@@ -30,6 +30,11 @@ impl Roots {
             .to_string()
     }
 
+    /// Whether an existing path resolves inside an allowed root.
+    pub fn contains(&self, path: &Path) -> bool {
+        path.canonicalize().is_ok_and(|c| self.0.iter().any(|r| c.starts_with(r)))
+    }
+
     fn absolute(&self, raw: &str) -> Result<PathBuf, ToolError> {
         if raw.is_empty() || raw.contains('\0') || raw.len() > 4096 {
             return Err(ToolError::invalid("path is empty, too long or contains NUL"));

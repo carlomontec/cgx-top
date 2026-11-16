@@ -2,10 +2,10 @@
 //! and `ccx_diagnose`, which explains convergence from `<job>.sta` / `<job>.cvg` / `<job>.json`.
 
 use crate::error::ToolError;
-use crate::frd_tools::{num, Table};
+use crate::frd_tools::{num, Page, Table};
 use crate::paths::Roots;
-use crate::jobs::{rss_mb, JobManager, Manifest, Prepared, State};
-use cgx_core::{diagnose, parse_cvg, parse_sta, scan_cards, DiagCtx, ScanLimits, Thresholds};
+use crate::jobs::{dir_size, rss_mb, JobManager, Manifest, Prepared, State};
+use cgx_core::{consolidate_inp, diagnose, parse_cvg, parse_sta, scan_cards, DiagCtx, ScanLimits, Thresholds};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -299,30 +299,53 @@ pub fn prepare_solve(roots: &Roots, jobs: &JobManager, p: CcxSolveIn) -> Result<
         return Err(ToolError::new("DECK_INVALID", "the deck has no *STEP").hint("Call inp_inspect to review the deck."));
     }
 
-    // Every file must live under the deck directory so the run directory can mirror the layout.
+    // Nothing the deck pulls in may come from outside the allowed roots.
     let deck_dir = deck.parent().unwrap_or(Path::new("/")).to_path_buf();
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (source, path relative to the deck directory)
-    let sources = std::iter::once(deck.clone())
-        .chain(scan.includes.iter().map(|i| i.resolved_path.clone()))
-        .chain(refs.iter().map(|r| r.resolved_path.clone()));
-    for source in sources {
+    let mut sources: Vec<(PathBuf, bool)> = vec![(deck.clone(), true)]; // (file, inlinable by consolidation)
+    sources.extend(scan.includes.iter().map(|i| (i.resolved_path.clone(), true)));
+    sources.extend(refs.iter().map(|r| (r.resolved_path.clone(), r.param.eq_ignore_ascii_case("INPUT"))));
+    let mut files: Vec<(PathBuf, Option<PathBuf>, bool)> = Vec::new(); // (source, path under the deck dir, inlinable)
+    for (source, inlinable) in sources {
+        if !roots.contains(&source) {
+            return Err(ToolError::new("PATH_OUTSIDE_ROOTS", format!("the deck references {} outside the allowed roots", source.display())));
+        }
         let canonical = source.canonicalize().map_err(ToolError::internal)?;
-        let rel = canonical.strip_prefix(&deck_dir).map(Path::to_path_buf).map_err(|_| {
-            ToolError::new("DECK_INVALID", format!("{} lies outside the deck directory", canonical.display()))
-                .hint("Call inp_consolidate to flatten the deck into one file, then solve that file.")
-        })?;
-        if !files.iter().any(|f| f.1 == rel) {
-            files.push((canonical, rel));
+        let rel = canonical.strip_prefix(&deck_dir).ok().map(Path::to_path_buf);
+        if !files.iter().any(|f| f.0 == canonical) {
+            files.push((canonical, rel, inlinable));
         }
     }
 
+    // Normal case: mirror the deck directory layout. If a file lies outside the deck directory
+    // the layout cannot be mirrored, so the deck is flattened into one file instead.
+    let flatten = files.iter().any(|f| f.1.is_none());
+    if let Some(stuck) = files.iter().find(|f| flatten && f.1.is_none() && !f.2) {
+        return Err(ToolError::new("DECK_INVALID", format!("{} is referenced by FILE= and lies outside the deck directory; it cannot be inlined", stuck.0.display()))
+            .hint("Move the file under the deck directory."));
+    }
+    let consolidated = if flatten {
+        Some(consolidate_inp(&deck).map_err(|e| ToolError::new("DECK_INVALID", e.to_string()))?.0)
+    } else {
+        None
+    };
+
     let (job_id, run_dir) = jobs.new_run_dir()?;
-    for (source, rel) in &files {
-        let target = run_dir.join(rel);
+    let mut copied = 0;
+    for (source, rel, inlinable) in &files {
+        let target = match (&consolidated, rel) {
+            (Some(_), _) if *inlinable => continue, // inlined into the flattened deck
+            (_, Some(rel)) => run_dir.join(rel),
+            (_, None) => continue,
+        };
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(ToolError::internal)?;
         }
-        std::fs::copy(source, &target).map_err(|e| ToolError::internal(format!("copying {}: {}", rel.display(), e)))?;
+        std::fs::copy(source, &target).map_err(|e| ToolError::internal(format!("copying {}: {}", source.display(), e)))?;
+        copied += 1;
+    }
+    if let Some(text) = &consolidated {
+        std::fs::write(run_dir.join(format!("{}.inp", jobname)), text).map_err(ToolError::internal)?;
+        copied += 1;
     }
 
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -337,7 +360,7 @@ pub fn prepare_solve(roots: &Roots, jobs: &JobManager, p: CcxSolveIn) -> Result<
         timeout_s: p.timeout_s.unwrap_or(3600).clamp(1, 86_400),
         label: p.label.map(|l| l.chars().take(60).collect()),
     };
-    Ok((prepared, files.len(), flags))
+    Ok((prepared, copied, flags))
 }
 
 pub fn solve_out(roots: &Roots, m: &Manifest, files_copied: usize, flags: Vec<String>) -> CcxSolveOut {
@@ -473,7 +496,13 @@ pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatu
         rss_mb: m.pid.filter(|_| m.state == State::Running).and_then(rss_mb),
         progress,
         verdict,
-        telemetry: json.map(|j| json!({ "meta": j["meta"], "steps": j["steps"] })),
+        telemetry: json.map(|mut j| {
+            // ccx writes a constant 1 here regardless of the threads used; drop it rather than mislead.
+            if let Some(meta) = j["meta"].as_object_mut() {
+                meta.remove("num_threads");
+            }
+            json!({ "meta": j["meta"], "steps": j["steps"] })
+        }),
         files,
         tail,
         next: next.into(),
@@ -492,6 +521,52 @@ pub struct CcxJobCancelOut {
     pub was: State,
     /// State now. Already finished jobs are returned unchanged
     pub state: State,
+}
+
+// ---------- ccx_job_list ----------
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CcxJobListIn {
+    /// Jobs to return (1..50, default 10)
+    pub limit: Option<usize>,
+    /// Jobs to skip, for paging (default 0)
+    pub offset: Option<usize>,
+    /// Only jobs in this state, e.g. RUNNING, FAILED, SUCCEEDED
+    pub state: Option<State>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CcxJobListOut {
+    /// Newest first. Columns: job_id, state, jobname, label, elapsed_s, run_dir_mb
+    pub jobs: Table,
+    pub page: Page,
+}
+
+/// Jobs of this server run and finished ones found on disk. Blocking (measures run directories).
+pub fn job_list(jobs: &JobManager, p: CcxJobListIn) -> CcxJobListOut {
+    let limit = p.limit.unwrap_or(10).clamp(1, 50);
+    let offset = p.offset.unwrap_or(0);
+    let (found, total) = jobs.list(p.state, offset, limit);
+    let rows = found
+        .iter()
+        .map(|m| {
+            let mb = dir_size(&m.run_dir) as f64 / (1024.0 * 1024.0);
+            vec![
+                json!(m.job_id),
+                json!(m.state),
+                json!(m.jobname),
+                json!(m.label),
+                json!(m.elapsed_s()),
+                json!((mb * 10.0).round() / 10.0),
+            ]
+        })
+        .collect();
+    let end = offset + found.len();
+    let page = Page { returned: found.len(), total, truncated: found.len() < total, next_offset: (end < total).then_some(end) };
+    CcxJobListOut {
+        jobs: Table { columns: ["job_id", "state", "jobname", "label", "elapsed_s", "run_dir_mb"].map(String::from).to_vec(), rows },
+        page,
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +609,47 @@ mod tests {
         assert_eq!(tail_text(&path, 100, 4096).unwrap().lines().count(), 50);
         assert!(tail_text(&path, 100, 40).unwrap().lines().count() < 8);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A deck whose include lies outside its own directory is flattened into the run directory;
+    /// one that reaches outside the roots is refused.
+    #[test]
+    fn solve_preflight_mirrors_or_flattens() {
+        let dir = std::env::temp_dir().join(format!("calculix-mcp-prep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("root/case/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("root/shared")).unwrap();
+        let step = "*STEP\n*STATIC\n*END STEP\n";
+        std::fs::write(dir.join("root/case/sub/mesh.inc"), "*NODE\n1,0.,0.,0.\n").unwrap();
+        std::fs::write(dir.join("root/shared/mat.inc"), "*MATERIAL, NAME=STEEL\n").unwrap();
+        std::fs::write(dir.join("secret.inc"), "*MATERIAL, NAME=SECRET\n").unwrap();
+        std::fs::write(dir.join("root/case/local.inp"), format!("*INCLUDE, INPUT=sub/mesh.inc\n{}", step)).unwrap();
+        std::fs::write(dir.join("root/case/shared.inp"), format!("*INCLUDE, INPUT=sub/mesh.inc\n*INCLUDE, INPUT=../shared/mat.inc\n{}", step)).unwrap();
+        std::fs::write(dir.join("root/case/escape.inp"), format!("*INCLUDE, INPUT=../../secret.inc\n{}", step)).unwrap();
+        std::fs::write(dir.join("root/case/nostep.inp"), "*NODE\n1,0.,0.,0.\n").unwrap();
+        std::fs::write(dir.join("root/case/broken.inp"), format!("*INCLUDE, INPUT=gone.inc\n{}", step)).unwrap();
+        let fake = dir.join("fake_ccx");
+        std::fs::write(&fake, "").unwrap();
+
+        let roots = Roots::new(vec![dir.join("root")]).unwrap();
+        let jobs = JobManager::new(roots.first(), vec![("fake".into(), fake)], Vec::new(), std::time::Duration::from_millis(100));
+        let prep = |deck: &str| prepare_solve(&roots, &jobs, CcxSolveIn { inp_path: format!("case/{}", deck), solver: None, threads: Some(1), timeout_s: None, label: None });
+
+        let (local, copied, _) = prep("local.inp").unwrap();
+        assert_eq!(copied, 2);
+        assert!(local.run_dir.join("sub/mesh.inc").exists() && local.run_dir.join("local.inp").exists());
+
+        let (shared, copied, _) = prep("shared.inp").unwrap();
+        assert_eq!(copied, 1, "flattened into a single deck");
+        let text = std::fs::read_to_string(shared.run_dir.join("shared.inp")).unwrap();
+        assert!(text.contains("NAME=STEEL") && text.contains("1,0.,0.,0.") && !text.to_uppercase().contains("*INCLUDE"));
+
+        assert_eq!(prep("escape.inp").unwrap_err().code, "PATH_OUTSIDE_ROOTS");
+        assert_eq!(prep("nostep.inp").unwrap_err().code, "DECK_INVALID");
+        let broken = prep("broken.inp").unwrap_err();
+        assert!(broken.code == "DECK_INVALID" && broken.valid[0].contains("gone.inc"));
+        assert_eq!(prepare_solve(&roots, &jobs, CcxSolveIn { inp_path: "case/local.inp".into(), solver: Some("pardiso".into()), threads: None, timeout_s: None, label: None }).err().unwrap().code, "UNKNOWN_SOLVER");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

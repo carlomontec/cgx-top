@@ -104,6 +104,39 @@ pub struct Set {
     pub element_ids: Vec<u32>,
 }
 
+impl Set {
+    /// Merge `other`'s ids into this set and remove duplicate ids, keeping first-seen order.
+    pub fn merge_from(&mut self, other: Set) {
+        self.node_ids.extend(other.node_ids);
+        self.element_ids.extend(other.element_ids);
+        self.dedup_ids();
+    }
+
+    /// Remove duplicate ids from `node_ids` and `element_ids`, keeping first-seen order.
+    pub fn dedup_ids(&mut self) {
+        dedup_keep_order(&mut self.node_ids);
+        dedup_keep_order(&mut self.element_ids);
+    }
+}
+
+/// Remove repeated values from `ids`, keeping the first occurrence of each.
+pub(crate) fn dedup_keep_order(ids: &mut Vec<u32>) {
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    ids.retain(|id| seen.insert(*id));
+}
+
+/// Merge `set` into `map` under `name`: a new name is inserted as is (de-duplicated),
+/// an existing one is merged with first-seen id order preserved.
+pub(crate) fn merge_set_into(map: &mut HashMap<String, Set>, name: String, mut set: Set) {
+    match map.get_mut(&name) {
+        Some(entry) => entry.merge_from(set),
+        None => {
+            set.dedup_ids();
+            map.insert(name, set);
+        }
+    }
+}
+
 /// Identifies the physical quantity represented by a dataset block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FieldType {
@@ -264,14 +297,7 @@ impl FrdModel {
     pub fn load_companion_sets<P: AsRef<std::path::Path>>(&mut self, frd_path: P) {
         let companion_sets = crate::parser::load_companion_sets(frd_path);
         for (name, set) in companion_sets {
-            let entry = self.sets.entry(name).or_insert_with(|| Set {
-                name: set.name.clone(),
-                set_type: set.set_type.clone(),
-                node_ids: Vec::new(),
-                element_ids: Vec::new(),
-            });
-            entry.node_ids.extend(set.node_ids);
-            entry.element_ids.extend(set.element_ids);
+            merge_set_into(&mut self.sets, name, set);
         }
     }
 
@@ -280,14 +306,7 @@ impl FrdModel {
         let inp_sets = crate::parser::parse_sets_from_inp(inp_path)?;
         let count = inp_sets.len();
         for (name, set) in inp_sets {
-            let entry = self.sets.entry(name).or_insert_with(|| Set {
-                name: set.name.clone(),
-                set_type: set.set_type.clone(),
-                node_ids: Vec::new(),
-                element_ids: Vec::new(),
-            });
-            entry.node_ids.extend(set.node_ids);
-            entry.element_ids.extend(set.element_ids);
+            merge_set_into(&mut self.sets, name, set);
         }
         Ok(count)
     }

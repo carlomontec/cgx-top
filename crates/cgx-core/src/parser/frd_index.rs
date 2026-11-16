@@ -34,6 +34,13 @@ pub struct DatasetEntry {
     pub format: u8,
     /// Byte range of the payload within the file
     pub payload: Range<usize>,
+    /// `1PSTEP` record before this block: (dataset counter, increment, analysis step of the deck)
+    pub pstep: Option<(u32, u32, u32)>,
+    /// `1PMODE` record: mode number, 1-based (frequency and buckling analyses)
+    pub mode: Option<u32>,
+    /// `1PHID` record: nodal diameter of a cyclic symmetry mode. ccx writes -1 when there is
+    /// none; that is stored as `None`.
+    pub nodal_diameter: Option<u32>,
 }
 
 /// Datasets that share one step counter value, in file order.
@@ -41,6 +48,13 @@ pub struct DatasetEntry {
 pub struct StepRef {
     pub step_number: u32,
     pub value: f32,
+    /// `pstep` of the first dataset of the step that has one. The first tuple element is a
+    /// per-dataset counter, so it identifies that dataset, not the step.
+    pub pstep: Option<(u32, u32, u32)>,
+    /// Mode number of the first dataset of the step that has one
+    pub mode: Option<u32>,
+    /// Nodal diameter of the first dataset of the step that has one
+    pub nodal_diameter: Option<u32>,
     /// Indices into `FrdIndex::entries()`
     pub entries: Vec<usize>,
 }
@@ -119,10 +133,18 @@ impl FrdIndex {
         let mut steps: Vec<StepRef> = Vec::new();
         for (idx, entry) in entries.iter().enumerate() {
             match steps.iter_mut().find(|s| s.step_number == entry.step_number) {
-                Some(step) => step.entries.push(idx),
+                Some(step) => {
+                    step.entries.push(idx);
+                    step.pstep = step.pstep.or(entry.pstep);
+                    step.mode = step.mode.or(entry.mode);
+                    step.nodal_diameter = step.nodal_diameter.or(entry.nodal_diameter);
+                }
                 None => steps.push(StepRef {
                     step_number: entry.step_number,
                     value: entry.value,
+                    pstep: entry.pstep,
+                    mode: entry.mode,
+                    nodal_diameter: entry.nodal_diameter,
                     entries: vec![idx],
                 }),
             }
@@ -158,11 +180,12 @@ impl FrdIndex {
     }
 
     /// Stress extrema per step, optionally restricted to a node set.
-    /// Equivalent to `FrdModel::compute_stress_history` without holding the datasets in memory.
+    ///
+    /// Only datasets named exactly `STRESS` count. Unlike `FrdModel::compute_stress_history`,
+    /// which matches the name by substring, the imaginary part `STRESSI` of a complex result
+    /// is never taken for a second real stress dataset.
     pub fn stress_history(&self, filter: Option<&HashSet<u32>>) -> Vec<StressExtremaSummary> {
-        self.history_jobs(|e| {
-            e.field_type == FieldType::Stress || e.name.to_uppercase().contains("STRESS")
-        })
+        self.history_jobs(|e| e.field_type == FieldType::Stress)
         .par_iter()
         .filter_map(|&(idx, step_number, value)| {
             let mut summ = self.load(idx).ok()?.stress_extrema(filter)?;
@@ -175,10 +198,10 @@ impl FrdIndex {
 
     /// Displacement extrema per step, optionally restricted to a node set.
     /// Equivalent to `FrdModel::compute_disp_history` without holding the datasets in memory.
+    /// Only datasets named exactly `DISP` count; the complex `PDISP` (magnitude and phase) is
+    /// summarised by `DenseDataset::pdisp_extrema` instead.
     pub fn disp_history(&self, filter: Option<&HashSet<u32>>) -> Vec<DispExtremaSummary> {
-        self.history_jobs(|e| {
-            e.field_type == FieldType::Displacement || e.name.to_uppercase().contains("DISP")
-        })
+        self.history_jobs(|e| e.field_type == FieldType::Displacement)
         .par_iter()
         .filter_map(|&(idx, step_number, value)| {
             let mut summ = self.load(idx).ok()?.disp_extrema(filter)?;
@@ -199,11 +222,43 @@ impl FrdIndex {
     }
 }
 
+/// Parameter records (`1P...`) seen since the last dataset; they describe the next `100C` block.
+#[derive(Default)]
+struct PendingParams {
+    pstep: Option<(u32, u32, u32)>,
+    mode: Option<u32>,
+    nodal_diameter: Option<u32>,
+}
+
+impl PendingParams {
+    /// Record one `1P` line. Values are read as whitespace-separated tokens after the key,
+    /// as CGX does (`sscanf("%*s %d")`); ccx writes them in 12-character columns from column 25.
+    fn read(&mut self, line: &[u8]) {
+        let text = std::str::from_utf8(line).unwrap_or("");
+        let mut tokens = text.split_whitespace();
+        let key = tokens.next().unwrap_or("");
+        let mut ints = tokens.map(|t| t.parse::<i64>().ok());
+        let mut next_u32 = || ints.next().flatten().and_then(|v| u32::try_from(v).ok());
+        match key {
+            "1PSTEP" => {
+                if let (Some(a), Some(b), Some(c)) = (next_u32(), next_u32(), next_u32()) {
+                    self.pstep = Some((a, b, c));
+                }
+            }
+            "1PMODE" => self.mode = next_u32(),
+            // -1 (no nodal diameter) fails the u32 conversion and becomes None.
+            "1PHID" => self.nodal_diameter = next_u32(),
+            _ => {}
+        }
+    }
+}
+
 /// Read the mesh blocks and every dataset header; skip the payloads.
 fn scan(data: &[u8]) -> Result<(FrdModel, Vec<DatasetEntry>)> {
     let mut engine = FrdParserEngine::from_bytes(data);
     let mut model = FrdModel::new();
     let mut entries = Vec::new();
+    let mut params = PendingParams::default();
 
     while let Some(line) = engine.cursor.read_line() {
         if is_blank(line) {
@@ -221,7 +276,12 @@ fn scan(data: &[u8]) -> Result<(FrdModel, Vec<DatasetEntry>)> {
         } else if has_key(line, b"3C") || line.starts_with(b"    3C") {
             model.elements = engine.parse_elements_block(line)?;
         } else if has_key(line, b"100C") || line.starts_with(b"  100C") {
-            entries.push(scan_dataset(&mut engine.cursor, data, line)?);
+            let mut entry = scan_dataset(&mut engine.cursor, data, line)?;
+            let p = std::mem::take(&mut params);
+            (entry.pstep, entry.mode, entry.nodal_diameter) = (p.pstep, p.mode, p.nodal_diameter);
+            entries.push(entry);
+        } else if line.trim_ascii_start().starts_with(b"1P") {
+            params.read(line);
         } else if line.starts_with(b"9999") {
             break;
         }
@@ -307,6 +367,9 @@ fn scan_dataset(cursor: &mut ByteCursor, data: &[u8], header: &[u8]) -> Result<D
         node_count,
         format,
         payload: payload_start..payload_end,
+        pstep: None,
+        mode: None,
+        nodal_diameter: None,
     })
 }
 

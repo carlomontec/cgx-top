@@ -88,6 +88,19 @@ cgx-top results/turbine.frd --set END_TIP_BLADE --mises
 
 ---
 
+## MCP server (calculix-mcp)
+
+The workspace also contains `calculix-mcp`, a Model Context Protocol server that lets an MCP client such as Claude Code or Claude Desktop inspect CalculiX decks, run the solver in the background, diagnose convergence from `.sta`/`.cvg` files, and query `.frd` results (including binary files and a 409 MB cyclic-symmetry result) with exact values and node ids.
+
+```bash
+cargo build --release -p calculix-mcp
+claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/case/dir --ccx mumps=/abs/path/to/CalculiX
+```
+
+See [`crates/calculix-mcp/README.md`](crates/calculix-mcp/README.md) for the tool list, worked examples, safety model and limitations.
+
+---
+
 ## Architecture
 
 `cgx-top` is built in Rust as a modular Cargo workspace:

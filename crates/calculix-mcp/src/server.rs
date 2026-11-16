@@ -3,13 +3,13 @@
 use crate::error::ToolError;
 use crate::jobs::JobManager;
 use crate::paths::Roots;
-use crate::{ccx_tools, frd_tools, inp_tools};
+use crate::{ccx_tools, frd_tools, inp_tools, mesh_tools};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, Json, ServerHandler};
 use std::sync::Arc;
 
-const INSTRUCTIONS: &str = "Native CalculiX tools. Decks: inp_inspect, then inp_cards to read specific cards; inp_consolidate to flatten. Solving: ccx_solve starts a background job, ccx_job_status (wait_s=30) follows it, ccx_job_cancel stops it, ccx_diagnose explains convergence. Results: frd_summary first, \
+const INSTRUCTIONS: &str = "Native CalculiX tools. Decks: inp_inspect, then inp_cards to read specific cards; inp_consolidate to flatten. Mesh: mesh_check before a long solve (parts, free nodes, inverted elements, volume, mass, undefined sets), mesh_select to find and save faces by geometry as a *SURFACE or *NSET include file. Solving: ccx_solve starts a background job, ccx_job_status (wait_s=30) follows it, ccx_job_cancel stops it, ccx_job_list lists recent jobs (also finished ones on disk), ccx_diagnose explains convergence. Results: frd_summary first, \
 then frd_sets and frd_query_set for exact per-set values. Paths are relative to the server root. \
 Never estimate stresses, displacements or frequencies; query them.";
 
@@ -76,6 +76,16 @@ impl CalculixServer {
     }
 
     #[tool(
+        name = "ccx_job_list",
+        description = "List solver jobs, newest first, with state, jobname, label, elapsed seconds and run directory size. Includes finished jobs from earlier server runs. Filter with state.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn ccx_job_list(&self, Parameters(p): Parameters<ccx_tools::CcxJobListIn>) -> Result<Json<ccx_tools::CcxJobListOut>, ToolError> {
+        let jobs = self.jobs.clone();
+        tokio::task::spawn_blocking(move || ccx_tools::job_list(&jobs, p)).await.map(Json).map_err(ToolError::internal)
+    }
+
+    #[tool(
         name = "inp_inspect",
         description = "Summarise a CalculiX .inp deck across its *INCLUDE tree: flags, keyword census, step plan, includes (missing ones first), sets, materials. Call first on any deck.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -100,6 +110,24 @@ impl CalculixServer {
     )]
     async fn inp_consolidate(&self, Parameters(p): Parameters<inp_tools::InpConsolidateIn>) -> Result<Json<inp_tools::InpConsolidateOut>, ToolError> {
         blocking(&self.roots, move |r| inp_tools::consolidate(r, p)).await
+    }
+
+    #[tool(
+        name = "mesh_check",
+        description = "Check a CalculiX deck's mesh before solving: disconnected parts, free nodes, inverted elements, worst aspect ratios, volume, mass and centre of gravity per material, undefined or empty sets. Call before a long solve.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn mesh_check(&self, Parameters(p): Parameters<mesh_tools::MeshCheckIn>) -> Result<Json<mesh_tools::MeshCheckOut>, ToolError> {
+        blocking(&self.roots, move |r| mesh_tools::check(r, p)).await
+    }
+
+    #[tool(
+        name = "mesh_select",
+        description = "Select faces of a CalculiX mesh by geometry (direction, plane, box, cylinder, near a point, connected patch from a seed) and optionally save them as a *SURFACE or *NSET include file. Returns count, area and bounding box so the selection can be checked before use. Never edits the deck.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn mesh_select(&self, Parameters(p): Parameters<mesh_tools::MeshSelectIn>) -> Result<Json<mesh_tools::MeshSelectOut>, ToolError> {
+        blocking(&self.roots, move |r| mesh_tools::select(r, p)).await
     }
 
     #[tool(
