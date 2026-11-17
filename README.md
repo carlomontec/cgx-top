@@ -97,7 +97,7 @@ cargo build --release -p calculix-mcp
 claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/case/dir --ccx ccx=/abs/path/to/CalculiX
 ```
 
-Pass `--ccx name=path` multiple times to register several MultiSolver builds (e.g. `accelerate`, `spooles`, `mumps`); the first one is the default.
+Pass `--ccx name=path` multiple times to register several MultiSolver builds (e.g. `accelerate`, `spooles`, `mumps`); the first one is the default. Every build must support `-j` JSON telemetry (the CalculiX MultiSolver fork); stock `ccx` is not supported.
 
 See [`crates/calculix-mcp/README.md`](crates/calculix-mcp/README.md) for the tool list, worked examples, safety model and limitations.
 

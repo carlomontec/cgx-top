@@ -580,10 +580,15 @@ fn classify(status: std::io::Result<std::process::ExitStatus>, m: &Manifest) -> 
     if code != Some(0) {
         return (State::Failed, code, signal, Some(format!("EXIT_CODE: solver exited with {}", code.unwrap_or(-1))));
     }
-    // Exit 0: trust the solver's own verdict when it wrote JSON telemetry.
-    let reported_failure = std::fs::read_to_string(m.run_dir.join(format!("{}.json", m.jobname)))
+    // Exit 0: the MultiSolver build must have written <job>.json (`-j`). Without it the
+    // server cannot tell success from failure, which usually means a stock ccx was configured.
+    let json_path = m.run_dir.join(format!("{}.json", m.jobname));
+    let Ok(text) = std::fs::read_to_string(&json_path) else {
+        return (State::Failed, code, signal, Some(
+            "SOLVER_NO_JSON: the solver exited 0 but wrote no <job>.json. --ccx must point to a CalculiX MultiSolver build that supports `-j` JSON telemetry; stock ccx is not supported.".into()));
+    };
+    let reported_failure = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .is_some_and(|v| v["meta"]["success"].as_bool() == Some(false));
     if reported_failure {
         return (State::Failed, code, signal, Some("SOLVER_REPORTED: <job>.json has meta.success = false".into()));
@@ -605,6 +610,7 @@ echo "fake solver mode=$mode threads=$OMP_NUM_THREADS home=$HOME"
 case "$mode" in
   ok)   echo '{"meta":{"success":true},"steps":[{"step_number":1,"converged":true}]}' > "$job.json"; exit 0 ;;
   bad)  echo '{"meta":{"success":false},"steps":[{"step_number":1,"converged":false}]}' > "$job.json"; exit 0 ;;
+  nojson) exit 0 ;;
   fail) echo " *ERROR in fake: boom"; exit 201 ;;
   hang) sleep 300 ;;
   flood) while :; do head -c 65536 /dev/zero >> flood.bin; sleep 0.02; done ;;
@@ -681,6 +687,10 @@ esac
         let bad = b.until(&b.start("bad", 30), State::terminal).await;
         assert_eq!(bad.state, State::Failed);
         assert!(bad.failure.unwrap().starts_with("SOLVER_REPORTED"));
+
+        let nojson = b.until(&b.start("nojson", 30), State::terminal).await;
+        assert_eq!(nojson.state, State::Failed);
+        assert!(nojson.failure.unwrap().starts_with("SOLVER_NO_JSON"));
 
         // The manifest on disk matches, and a new manager can still answer for the job.
         let again = JobManager::new(&b.dir, Vec::new(), Vec::new(), Duration::from_millis(100));

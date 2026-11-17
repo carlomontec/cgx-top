@@ -27,6 +27,8 @@ The binary is `target/release/calculix-mcp`. It needs a Rust toolchain (edition 
 calculix-mcp --root /abs/case/dir --ccx ccx=/abs/path/to/CalculiX
 ```
 
+`--ccx` must point to a CalculiX **MultiSolver** build that supports `-j` JSON telemetry (it writes `<job>.json`). Stock CalculiX is not supported: the server starts with a warning if the binary does not mention `CCX_JSON`, and a solve that exits 0 without writing `<job>.json` is marked failed with `SOLVER_NO_JSON`.
+
 Pass `--ccx NAME=PATH` multiple times to expose several MultiSolver builds (for example `--ccx accelerate=... --ccx spooles=... --ccx mumps=...`); the first is used when `solver` is omitted. `ccx_solve` invokes the binary with `-j <jobname>` to enable MultiSolver JSON telemetry.
 
 | Flag | Meaning |

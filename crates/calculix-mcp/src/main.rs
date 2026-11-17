@@ -50,6 +50,12 @@ fn parse_solvers(specs: &[String]) -> anyhow::Result<Vec<(String, PathBuf)>> {
         .collect()
 }
 
+/// Heuristic startup check: MultiSolver builds contain the `CCX_JSON` marker string.
+/// Only a warning: a wrapper script around a real build would not contain it.
+fn advertises_json(path: &std::path::Path) -> bool {
+    std::fs::read(path).map(|b| b.windows(8).any(|w| w == b"CCX_JSON")).unwrap_or(true)
+}
+
 /// Resolves when the process is asked to stop (Ctrl-C, or SIGTERM on Unix).
 async fn stop_signal() {
     #[cfg(unix)]
@@ -73,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
 
     let solvers = parse_solvers(&args.ccx)?;
     eprintln!("solvers: {}", if solvers.is_empty() { "none (ccx_solve disabled; pass --ccx NAME=PATH)".into() } else { solvers.iter().map(|s| s.0.as_str()).collect::<Vec<_>>().join(", ") });
+    for (name, path) in &solvers {
+        if !advertises_json(path) {
+            eprintln!("warning: solver '{}' ({}) does not mention CCX_JSON; ccx_solve needs a MultiSolver build with `-j` JSON telemetry", name, path.display());
+        }
+    }
     anyhow::ensure!(args.max_run_gb.is_finite() && args.max_run_gb > 0.0, "--max-run-gb must be a positive number");
     let max_run_bytes = (args.max_run_gb * 1024.0 * 1024.0 * 1024.0) as u64;
     let jobs = jobs::JobManager::new(roots.first(), solvers, args.env_passthrough, std::time::Duration::from_secs(5))
