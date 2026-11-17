@@ -33,8 +33,12 @@ class Server:
         return bool(r.get("isError")), r.get("structuredContent", r)
 def show(tag, v, n=700): print(tag, json.dumps(v)[:n], "\n")
 
-ccx = sys.argv[1]
-s = Server(["--root", "target/mcp-solve/cube", "--ccx", "mumps=" + ccx])
+ccx_arg = sys.argv[1]
+if "=" in ccx_arg:
+    solver_name, ccx = ccx_arg.split("=", 1)
+else:
+    solver_name, ccx = "ccx", ccx_arg
+s = Server(["--root", "target/mcp-solve/cube", "--ccx", f"{solver_name}={ccx}"])
 print("tools:", sorted(t["name"] for t in s.rpc("tools/list", {})["tools"]), "\n")
 show("unknown solver:", s.call("ccx_solve", inp_path="cube.inp", solver="pardiso")[1])
 err, job = s.call("ccx_solve", inp_path="cube.inp", threads=2, label="smoke"); show("solve:", job); assert not err
