@@ -11,8 +11,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Carlo Montecalvo"]
 license = "MIT"
-repository = "https://github.com/carlomontec/cgx-top"
-description = "The terminal companion to CalculiX GraphiX (CGX) - Interactive FEA inspection TUI"
+repository = "https://github.com/carlomontec/calculix-mcp-rs"
+description = "MCP server and Rust toolkit that let AI agents inspect, check, solve and post-process CalculiX models"
 
 [workspace.dependencies]
 # Performance and zero-copy

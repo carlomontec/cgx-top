@@ -319,7 +319,7 @@ The lazy figure for resident memory is mostly memory-mapped file pages, which th
 - For steps that have a complex `PDISP` dataset and no `DISP`, `u_max` is `sqrt(MAG1^2 + MAG2^2 + MAG3^2)` maximised over nodes. It is an upper bound of the amplitude, not the amplitude itself.
 - There is no stall detection, no MCP resources or prompts, and no progress notifications yet.
 - The `threads` argument is passed to the solver through `OMP_NUM_THREADS` and `CCX_NPROC_*`. The solver's JSON output always reports `num_threads: 1` (a constant in the MultiSolver source), so the thread count in effect cannot be confirmed from the output.
-- `mesh_check` computes volume, mass and centre of gravity from corner nodes only, so the values for curved quadratic elements are approximate. They have not yet been cross-checked by an independent method. Values are in deck units; no unit conversion is applied.
+- `mesh_check` computes volume, mass and centre of gravity from corner nodes only, so the values for curved quadratic elements are approximate: on a coarse 16-segment C3D20 ring the volume comes out 2.55 % low. The element volumes are cross-checked in the tests against a surface integral over the exterior faces. Values are in deck units; no unit conversion is applied.
 - `mesh_select` works on the exterior faces of solid elements. Shell and beam elements are ignored.
 - `mesh_select` writes selections to include files. The deck itself is never edited, so you add the `*INCLUDE` line the tool returns.
 - No geometry creation, meshing or deck editing, and no rendering: the server returns numbers and tables, not images.
