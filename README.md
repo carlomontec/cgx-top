@@ -44,17 +44,12 @@ Other things you can ask:
 
 Full transcripts with the raw tool output are in [`crates/calculix-mcp/README.md`](crates/calculix-mcp/README.md).
 
-## Why it is different
+## Highlights
 
-Most CalculiX automation drives a small generated model: write a template deck, run it, print a few values. `calculix-mcp` is built for the models engineers actually have:
-
-- **Real decks.** Follows the whole `*INCLUDE` tree, reports the step plan, sets, materials and missing files, and reads any keyword card with its file and line.
-- **Cyclic symmetry and modal results.** Recognises `*CYCLIC SYMMETRY MODEL`, and result steps carry mode number and nodal diameter.
-- **Large and binary result files.** `.frd` files are indexed lazily and only the requested dataset is read; a 409 MB file is summarised in well under a second.
-- **Preprocessing support.** Mesh checks (parts, free nodes, inverted elements, aspect ratio, volume, mass, centre of gravity, undefined sets) and face selection by direction, plane, box, cylinder, proximity or connected patch, saved as `*SURFACE` or `*NSET` include files.
-- **Solver jobs that clean up after themselves.** Each solve runs on a private copy of the deck in its own process group, with timeout, disk quota, cancellation and crash recovery. Your original directory is never written to.
-- **Convergence diagnosis.** Reads `.sta` and `.cvg` and classifies a run as linear, smooth, slow, contact chattering, cutback loop or diverging, with the evidence and the next thing to check.
-- **Exact values with node ids.** Von Mises, principal, Tresca, hydrostatic and displacement extrema per set and per step, with the responsible nodes and their coordinates.
+- Works on existing decks: the whole `*INCLUDE` tree, cyclic symmetry, modal results with mode number and nodal diameter.
+- Reads large ASCII and binary `.frd` files lazily; a 409 MB file is summarised in well under a second.
+- Solves on a private copy of the deck and always cleans up its processes.
+- Returns exact values with node ids, plus notes when a number needs context.
 
 ## Quick start
 
