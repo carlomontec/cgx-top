@@ -11,13 +11,21 @@ It is written in Rust, works on the decks and result files you already have, and
 
 ```mermaid
 flowchart LR
-    C["AI client<br/>Claude Code · Claude Desktop · Antigravity"] -- "MCP (JSON-RPC over stdio)" --> S["calculix-mcp"]
-    S --> D["Decks<br/>.inp + *INCLUDE tree"]
-    S --> M["Mesh<br/>checks · face selection"]
-    S --> J["Solver jobs<br/>ccx in isolated run dirs"]
-    S --> T["Convergence<br/>.sta · .cvg · .json"]
-    S --> R["Results<br/>.frd ASCII + binary"]
+    C["AI client<br/>Claude Code · Antigravity"] -- "MCP (stdio)" --> S["calculix-mcp<br/>this repository"]
+    S --> F["Your models<br/>.inp decks · meshes · .frd results"]
+    S --> M["CalculiX MultiSolver<br/>solve · JSON telemetry"]
+    S -.-> G["CalculiX GraphiX GLFW<br/>meshing · contour images (planned)"]
 ```
+
+## Part of a CalculiX toolchain
+
+`calculix-mcp` is one of three projects that together give CalculiX a modern, scriptable workflow:
+
+| Project | Role |
+|---|---|
+| **calculix-mcp-rs** (this repository) | The MCP server and the Rust library behind it: deck inspection, mesh checks and face selection, solver jobs, convergence diagnosis, result queries |
+| [**CalculiX MultiSolver**](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver) | A multi-platform edition of the CalculiX solver (CrunchiX) with selectable sparse solvers (MUMPS, Apple Accelerate, PARDISO, SPOOLES) and JSON run telemetry, which `calculix-mcp` reads to report each solve |
+| [**CalculiX GraphiX GLFW**](https://github.com/carlomontec/CalculiX-GraphiX-GLFW) | A multi-platform edition of the CalculiX pre- and post-processor (GraphiX) on GLFW, with a command channel that will let `calculix-mcp` mesh geometry and render contour plots |
 
 ## What a session looks like
 
@@ -51,7 +59,9 @@ Full transcripts with the raw tool output are in [`crates/calculix-mcp/README.md
 - Solves on a private copy of the deck and always cleans up its processes.
 - Returns exact values with node ids, plus notes when a number needs context.
 
-## Quick start
+## Install and connect
+
+### 1. Build
 
 ```bash
 git clone https://github.com/carlomontec/calculix-mcp-rs.git
@@ -59,26 +69,57 @@ cd calculix-mcp-rs
 cargo build --release -p calculix-mcp
 ```
 
-Register it with Claude Code:
+The server is `target/release/calculix-mcp`. You need a Rust toolchain, and for solving, a build of [CalculiX MultiSolver](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver). Every other tool works without a solver.
+
+### 2. Connect your AI client
+
+Two flags matter: `--root` is the folder the server may read and write (your cases), and `--ccx NAME=PATH` registers a solver build. Repeat `--ccx` to offer several (for example `accelerate`, `spooles`, `mumps`); the first is the default. Use absolute paths.
+
+**Claude Code**: register once from a terminal:
 
 ```bash
-claude mcp add calculix -- /abs/path/to/target/release/calculix-mcp --root /abs/path/to/cases --ccx mumps=/abs/path/to/CalculiX
+claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/path/to/cases --ccx mumps=/abs/path/to/CalculiX
 ```
 
-Or add it to `.mcp.json` (Claude Code), `claude_desktop_config.json` (Claude Desktop) or `~/.gemini/config/mcp_config.json` (Antigravity):
+or put this in a `.mcp.json` file at the root of your project, to share the setup with the project:
 
 ```json
 {
   "mcpServers": {
     "calculix": {
-      "command": "/abs/path/to/target/release/calculix-mcp",
+      "type": "stdio",
+      "command": "/abs/path/to/calculix-mcp",
       "args": ["--root", "/abs/path/to/cases", "--ccx", "mumps=/abs/path/to/CalculiX"]
     }
   }
 }
 ```
 
-`--root` limits the directories the server may touch. `--ccx NAME=PATH` registers a solver; repeat it to offer several builds (for example `accelerate`, `spooles`, `mumps`). Solving currently requires the CalculiX MultiSolver fork, which writes JSON telemetry with `-j`; every other tool works without any solver installed. All flags are documented in the [server README](crates/calculix-mcp/README.md#run-and-flags).
+Check that it is connected with `/mcp` inside Claude Code.
+
+**Antigravity**: add the same `mcpServers` block to `~/.gemini/config/mcp_config.json`, then reload the MCP servers in Antigravity.
+
+Claude Desktop reads the same block from its `claude_desktop_config.json`; this setup has not been tested yet.
+
+### 3. Talk to it
+
+Ask in plain language; the agent picks the tools. Paths are relative to `--root`.
+
+```text
+What does run/bracket.inp do? Any missing includes?
+Check the mesh of run/bracket.inp before I solve it.
+Save the bolt hole along z through (40, 0), radius 6, as a surface called BORE.
+Solve run/bracket.inp with mumps and tell me when it is done.
+What is the peak von Mises stress on set FILLET, and at which nodes?
+```
+
+The server never edits your deck: selections go to new include files, and solves run on a copy in `<root>/.calculix-mcp/runs/`.
+
+### Platforms
+
+The configuration is the same JSON on every operating system; only file locations and path syntax differ (on Windows, write paths in JSON as `C:/cases` or `C:\\cases`). The server is developed and tested on macOS. Linux uses the same mechanisms and is expected to work but has not been tested yet. On Windows it is untested, and stopping a solver ends only its direct process, not the processes it started.
+
+All flags are documented in the [server README](crates/calculix-mcp/README.md#run-and-flags).
 
 ## Tools
 
