@@ -202,7 +202,7 @@ pub fn check(roots: &Roots, p: MeshCheckIn) -> Result<MeshCheckOut, ToolError> {
         },
         problems: ProblemsOut { total: problems_total, items },
         notes: [
-            "Volume, mass and centre of gravity use corner nodes only (mid-side nodes are ignored), so curved quadratic edges are approximated.".into(),
+            "Volume, mass and centre of gravity use corner nodes only (mid-side nodes are ignored), so curved quadratic edges are approximated (~2.55% shortfall on a 16-segment C3D20 annulus).".into(),
             "Values are in the units of the deck; no unit conversion is applied.".into(),
             "Aspect is the longest over the shortest corner-node edge of an element. Only solid elements are measured.".into(),
         ]
@@ -704,6 +704,35 @@ mod tests {
         assert_eq!(out.mass.unassigned_elements, 1);
         assert!(out.mass.mass.is_none());
         assert!(out.problems.items.iter().any(|m| m.starts_with("deck.inp:") && m.contains("GHOST")), "{:?}", out.problems.items);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inverted_element_returns_review() {
+        let inverted = "\
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 5, 6, 7, 8, 1, 2, 3, 4
+*MATERIAL, NAME=STEEL
+*ELASTIC
+210000., 0.3
+*DENSITY
+7.85e-9
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+";
+        let (dir, roots) = setup(inverted);
+        let out = check(&roots, MeshCheckIn { path: "deck.inp".into() }).unwrap();
+        assert_eq!(out.verdict, "REVIEW");
+        assert_eq!(out.quality.non_positive_volume.count, 1);
+        assert_eq!(out.quality.non_positive_volume.first, vec![1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

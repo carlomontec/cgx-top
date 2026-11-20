@@ -23,6 +23,7 @@ Cargo.lock
 # Test fixtures are tracked even when they look like simulation output
 !crates/*/tests/fixtures/**
 
-# calculix-mcp run directories and agent worktrees
+# calculix-mcp run directories, local MCP config, and agent worktrees
 .calculix-mcp/
+.mcp.json
 .claude/worktrees/

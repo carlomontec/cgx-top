@@ -270,3 +270,126 @@ fn on_cylinder_selects_only_the_bore() {
     assert!(near_point(&faces, [100.0, 0.0, 0.0], 0.1).is_empty());
     assert!(nearest_face(&[], p).is_none());
 }
+
+fn surface_closure_and_volume(mesh: &InpMesh) -> (f64, f64, f64) {
+    let faces = exterior_faces(mesh);
+    let mut total_area = 0.0;
+    let mut normal_sum = [0.0; 3];
+    let mut tri_normal_sum = [0.0; 3];
+    let mut vol_sum = 0.0;
+    let pt = |id: u32| {
+        let n = &mesh.nodes[mesh.node_index[&id]];
+        [n.x, n.y, n.z]
+    };
+    let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+    for f in &faces {
+        total_area += f.area;
+        for k in 0..3 {
+            normal_sum[k] += f.area * f.normal[k];
+        }
+        // Triangulate the face (fan from corner 0) so warped quads are integrated cleanly.
+        let p0 = pt(f.corners[0]);
+        for i in 1..f.corners.len() - 1 {
+            let p1 = pt(f.corners[i]);
+            let p2 = pt(f.corners[i + 1]);
+            let area_vec_x2 = cross(sub(p1, p0), sub(p2, p0));
+            for k in 0..3 {
+                tri_normal_sum[k] += 0.5 * area_vec_x2[k];
+            }
+            let c = [(p0[0] + p1[0] + p2[0]) / 3.0, (p0[1] + p1[1] + p2[1]) / 3.0, (p0[2] + p1[2] + p2[2]) / 3.0];
+            vol_sum += dot(c, area_vec_x2) / 6.0;
+        }
+    }
+    let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    (norm(normal_sum) / total_area, norm(tri_normal_sum) / total_area, vol_sum)
+}
+
+#[test]
+fn closed_surface_identity_and_surface_integral_volume() {
+    for (label, deck) in [("block2", block(2, [0.0; 3], 1, 1, "Blk")), ("quad_cube", quad_cube(2.0))] {
+        let (m, _) = load(&deck);
+        let elem_vol: f64 = (0..m.elements.len()).map(|i| element_volume(&m, i).unwrap()).sum();
+        let (closure_res, tri_closure_res, surf_vol) = surface_closure_and_volume(&m);
+        let rel_vol_err = (surf_vol - elem_vol).abs() / elem_vol;
+        println!("{label}: closure_res={closure_res:.3e}, tri_closure_res={tri_closure_res:.3e}, elem_vol={elem_vol:.9}, surf_vol={surf_vol:.9}, rel_err={rel_vol_err:.3e}");
+        assert!(closure_res < 1e-12, "{label} closure residual {closure_res}");
+        assert!(tri_closure_res < 1e-12, "{label} tri closure residual {tri_closure_res}");
+        assert!(rel_vol_err < 1e-9, "{label} volume mismatch {rel_vol_err}");
+    }
+
+    let rotor = PathBuf::from("/Users/carlo/code/CalculiX/ccx/CalculiX-CrunchiX-MultiSolver/benchmarks/compressor_rotor/lavffcyc.inp");
+    if !rotor.exists() {
+        return;
+    }
+    let m = read_inp_mesh(&rotor).unwrap();
+    let elem_vol: f64 = (0..m.elements.len()).map(|i| element_volume(&m, i).unwrap()).sum();
+    let (closure_res, tri_closure_res, surf_vol) = surface_closure_and_volume(&m);
+    let rel_vol_err = (surf_vol - elem_vol).abs() / elem_vol;
+    println!("lavffcyc: closure_res={closure_res:.3e}, tri_closure_res={tri_closure_res:.3e}, elem_vol={elem_vol:.6}, surf_vol={surf_vol:.6}, rel_err={rel_vol_err:.3e}");
+    assert!(closure_res < 1e-3, "rotor face-normal closure residual {closure_res}");
+    assert!(tri_closure_res < 1e-12, "rotor triangulated closure residual {tri_closure_res}");
+    assert!(rel_vol_err < 0.01, "rotor surface vs element volume mismatch {rel_vol_err}");
+}
+
+#[test]
+fn curved_c3d20_annulus_corner_node_approximation_error() {
+    // Annulus r in [1, 2], 16 segments, 0 <= z <= 1 with curved C3D20 mid-side nodes on the circles.
+    let seg = 16usize;
+    let mut nodes: Vec<(usize, f64, f64, f64)> = Vec::new();
+    let mut next_id = 1usize;
+    let mut pt_map = std::collections::HashMap::<(usize, usize, usize), usize>::new();
+    let mut add_pt = |ring2: usize, i2: usize, k2: usize| -> usize {
+        let key = (ring2, i2 % (2 * seg), k2);
+        if let Some(&id) = pt_map.get(&key) {
+            return id;
+        }
+        let r = 1.0 + 0.5 * ring2 as f64;
+        let th = 2.0 * std::f64::consts::PI * (key.1 as f64) / ((2 * seg) as f64);
+        let z = 0.5 * k2 as f64;
+        let id = next_id;
+        next_id += 1;
+        nodes.push((id, r * th.cos(), r * th.sin(), z));
+        pt_map.insert(key, id);
+        id
+    };
+
+    let mut elems = Vec::new();
+    for i in 0..seg {
+        let i0 = 2 * i;
+        let im = 2 * i + 1;
+        let i1 = 2 * i + 2;
+        let n = [
+            // corners: bottom (k=0) then top (k=2)
+            add_pt(0, i0, 0), add_pt(2, i0, 0), add_pt(2, i1, 0), add_pt(0, i1, 0),
+            add_pt(0, i0, 2), add_pt(2, i0, 2), add_pt(2, i1, 2), add_pt(0, i1, 2),
+            // mid-sides bottom: 8..11
+            add_pt(1, i0, 0), add_pt(2, im, 0), add_pt(1, i1, 0), add_pt(0, im, 0),
+            // mid-sides top: 12..15
+            add_pt(1, i0, 2), add_pt(2, im, 2), add_pt(1, i1, 2), add_pt(0, im, 2),
+            // vertical mid-sides: 16..19
+            add_pt(0, i0, 1), add_pt(2, i0, 1), add_pt(2, i1, 1), add_pt(0, i1, 1),
+        ];
+        elems.push((i + 1, n));
+    }
+
+    let mut d = String::from("*NODE\n");
+    for (id, x, y, z) in nodes {
+        d += &format!("{id}, {x:.15}, {y:.15}, {z:.15}\n");
+    }
+    d += "*ELEMENT, TYPE=C3D20\n";
+    for (eid, ns) in elems {
+        let s: Vec<String> = ns.iter().map(|v| v.to_string()).collect();
+        d += &format!("{eid}, {}\n", s.join(", "));
+    }
+
+    let (m, _) = load(&d);
+    let corner_vol: f64 = (0..m.elements.len()).map(|i| element_volume(&m, i).unwrap()).sum();
+    let analytic_vol = std::f64::consts::PI * (4.0 - 1.0) * 1.0;
+    let rel_err = (analytic_vol - corner_vol).abs() / analytic_vol;
+    println!("C3D20 16-seg annulus: analytic={analytic_vol:.6}, corner_vol={corner_vol:.6}, rel_err={:.3}%", rel_err * 100.0);
+    // Exact 16-gon prism shortfall is 1 - sin(pi/8)/(pi/8) ≈ 2.55%.
+    assert!((rel_err - 0.0255).abs() < 0.001, "unexpected corner-node error {rel_err}");
+}
