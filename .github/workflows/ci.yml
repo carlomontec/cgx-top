@@ -1,0 +1,107 @@
+name: CI calculix-mcp
+
+on:
+  push:
+    branches: [ main, 'fix/**', 'feat/**' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # 1. Build and unit tests on every platform
+  # ============================================================================
+  test:
+    name: Rust tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: Linux x86_64
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+          - os: macos-14
+            name: macOS arm64
+          - os: windows-latest
+            name: Windows x86_64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  # ============================================================================
+  # 2. End to end on Linux: build CalculiX MultiSolver (MUMPS), then drive a
+  #    real solve through the MCP server over stdio
+  # ============================================================================
+  e2e:
+    name: End to end with CalculiX MultiSolver (Linux, MUMPS)
+    runs-on: ubuntu-24.04
+    needs: test
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check out CalculiX MultiSolver
+        uses: actions/checkout@v4
+        with:
+          repository: carlomontec/CalculiX-CrunchiX-MultiSolver
+          path: multisolver
+
+      - name: Install solver build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gfortran cmake ninja-build \
+            libarpack2-dev libopenblas-dev liblapack-dev libmumps-seq-dev
+
+      - name: Cache the solver build
+        id: ccx-cache
+        uses: actions/cache@v4
+        with:
+          path: multisolver/build_mumps/CalculiX
+          key: ccx-mumps-${{ runner.os }}-${{ hashFiles('multisolver/src/**', 'multisolver/CMakeLists.txt', 'multisolver/cmake/**') }}
+
+      - name: Build CalculiX MultiSolver
+        if: steps.ccx-cache.outputs.cache-hit != 'true'
+        working-directory: multisolver
+        run: |
+          cmake -B build_mumps -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCCX_USE_MUMPS=ON -DCCX_USE_PARDISO=OFF -DCCX_USE_SPOOLES=OFF -DCCX_USE_ACCELERATE=OFF \
+            -DCCX_USE_ARPACK=ON
+          cmake --build build_mumps -j$(nproc)
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the MCP server
+        run: cargo build -p calculix-mcp --locked
+
+      - name: Solve, diagnose and query through the MCP server
+        run: |
+          export OMP_NUM_THREADS=1
+          python3 crates/calculix-mcp/tests/smoke/drive.py "mumps=$GITHUB_WORKSPACE/multisolver/build_mumps/CalculiX"

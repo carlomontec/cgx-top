@@ -130,6 +130,123 @@ pub fn free_nodes(mesh: &InpMesh) -> Vec<u32> {
     out
 }
 
+/// Node usage outside elements: nodes no element uses, split into reference nodes (named by
+/// a deck card) and truly free nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeUsage {
+    /// Nodes that no element and no deck card uses, ascending.
+    pub free: Vec<u32>,
+    /// Nodes in no element that a card uses, ascending by id, with the keyword of the first
+    /// card (in deck order) that uses each.
+    pub reference: Vec<(u32, String)>,
+}
+
+fn node_id(field: &str) -> Option<u32> {
+    field.trim().parse::<u32>().ok()
+}
+
+/// Node ids a card names outside element definitions, in order of appearance.
+///
+/// Per the CalculiX manual: `*RIGID BODY` parameters `REF NODE` and `ROT NODE`; `*COUPLING`
+/// parameter `REF NODE`; `*EQUATION` data (a term-count line, then `node, dof, coefficient`
+/// triples, up to four terms per line; a node set in the first term is skipped; no data is
+/// read with `REMOVE`); `*MPC` data (a name, then node ids, zeros discarded); `*BOUNDARY` and
+/// `*CLOAD` lines whose first field is a numeric node id.
+fn card_node_ids(card: &InpCard) -> Vec<u32> {
+    let mut out = Vec::new();
+    match card.keyword.as_str() {
+        "RIGID BODY" => {
+            for key in ["REF NODE", "ROT NODE"] {
+                out.extend(param(card, key).and_then(node_id));
+            }
+        }
+        "COUPLING" => out.extend(param(card, "REF NODE").and_then(node_id)),
+        "EQUATION" => {
+            if card.params.iter().any(|(k, _)| k == "REMOVE" || k == "REMOVE ALL") {
+                return out;
+            }
+            let Ok(data) = read_card_data(card, card.data_lines) else { return out };
+            // `need` = fields still to read for the current equation; 0 = next line is a count.
+            let mut need = 0usize;
+            let mut index = 0usize;
+            for line in &data {
+                let fields: Vec<&str> = line.split(',').map(str::trim).filter(|f| !f.is_empty()).collect();
+                if need == 0 {
+                    let Some(terms) = fields.first().and_then(|f| f.parse::<usize>().ok()) else { continue };
+                    need = terms * 3;
+                    index = 0;
+                    if fields.len() > 1 {
+                        // Tolerate a count followed by terms on the same line.
+                        for f in &fields[1..] {
+                            if index.is_multiple_of(3) {
+                                out.extend(node_id(f));
+                            }
+                            index += 1;
+                        }
+                        need = need.saturating_sub(fields.len() - 1);
+                    }
+                    continue;
+                }
+                for f in &fields {
+                    if need == 0 {
+                        break;
+                    }
+                    if index.is_multiple_of(3) {
+                        out.extend(node_id(f));
+                    }
+                    index += 1;
+                    need -= 1;
+                }
+            }
+        }
+        "MPC" => {
+            let Ok(data) = read_card_data(card, card.data_lines) else { return out };
+            for (i, line) in data.iter().enumerate() {
+                for (j, f) in line.split(',').enumerate() {
+                    if i == 0 && j == 0 {
+                        continue; // MPC name
+                    }
+                    out.extend(node_id(f).filter(|&n| n != 0));
+                }
+            }
+        }
+        "BOUNDARY" | "CLOAD" => {
+            let Ok(data) = read_card_data(card, card.data_lines) else { return out };
+            for line in &data {
+                out.extend(line.split(',').next().and_then(node_id));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Split the nodes that no element uses into reference nodes and free nodes, see
+/// [`NodeUsage`] and the card list in the module's `card_node_ids`.
+pub fn node_usage(mesh: &InpMesh, scan: &InpScan) -> NodeUsage {
+    let unused: HashSet<u32> = free_nodes(mesh).into_iter().collect();
+    let mut reference: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+    for card in &scan.cards {
+        for id in card_node_ids(card) {
+            if unused.contains(&id) {
+                reference.entry(id).or_insert_with(|| card.keyword.clone());
+            }
+        }
+    }
+    let free = free_nodes(mesh).into_iter().filter(|id| !reference.contains_key(id)).collect();
+    NodeUsage { free, reference: reference.into_iter().collect() }
+}
+
+/// Connection cards that can join separate parts, in this fixed order, those present in the
+/// deck: RIGID BODY, TIE, CONTACT PAIR, EQUATION, MPC, COUPLING.
+pub fn joining_cards(scan: &InpScan) -> Vec<String> {
+    ["RIGID BODY", "TIE", "CONTACT PAIR", "EQUATION", "MPC", "COUPLING"]
+        .into_iter()
+        .filter(|k| scan.cards.iter().any(|c| c.keyword == *k))
+        .map(String::from)
+        .collect()
+}
+
 /// Element quality summary, solids only.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualityReport {

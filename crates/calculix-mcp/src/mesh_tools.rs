@@ -4,7 +4,7 @@ use crate::error::{nearest, ToolError};
 use crate::frd_tools::Table;
 use crate::paths::Roots;
 use cgx_core::{
-    by_normal, components, connected_patch, exterior_faces, face_nodes, faces_of_surface, free_nodes, in_box, mass_properties,
+    by_normal, components, connected_patch, exterior_faces, face_nodes, faces_of_surface, in_box, joining_cards, node_usage, mass_properties,
     near_point, nearest_face, on_cylinder, on_plane, quality, read_inp_mesh, reference_problems, scan_cards, write_nset_card,
     write_surface_card, Face, InpMesh, InpScan, ScanLimits,
 };
@@ -71,6 +71,22 @@ pub struct PartsOut {
     pub count: usize,
     /// Element counts of the 10 largest parts, largest first
     pub largest_sizes: Vec<usize>,
+    /// Connection cards present in the deck that can join separate parts (RIGID BODY, TIE, CONTACT PAIR, EQUATION, MPC, COUPLING); empty if none
+    pub joined_by: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReferenceNode {
+    pub node: u32,
+    /// Keyword of the first card that uses the node, for example RIGID BODY
+    pub card: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReferenceNodesOut {
+    pub count: usize,
+    /// At most the first 10 nodes, ascending
+    pub first: Vec<ReferenceNode>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -113,7 +129,7 @@ pub struct ProblemsOut {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct MeshCheckOut {
-    /// OK, or REVIEW when there is more than one part, a free node, a non-positive volume, an unassigned element or a problem
+    /// OK, or REVIEW when there are several parts and no connecting card, a free node, a non-positive volume, an unassigned element or a problem
     pub verdict: String,
     pub nodes: usize,
     pub elements: usize,
@@ -121,8 +137,10 @@ pub struct MeshCheckOut {
     pub element_types: BTreeMap<String, usize>,
     pub bounding_box: BBox,
     pub parts: PartsOut,
-    /// Nodes that no element uses
+    /// Nodes that no element and no card uses
     pub free_nodes: IdList,
+    /// Nodes in no element that a card uses (RIGID BODY REF NODE / ROT NODE, COUPLING REF NODE, EQUATION, MPC, BOUNDARY, CLOAD)
+    pub reference_nodes: ReferenceNodesOut,
     pub quality: QualityOut,
     pub mass: MassOut,
     pub problems: ProblemsOut,
@@ -144,7 +162,8 @@ pub fn check(roots: &Roots, p: MeshCheckIn) -> Result<MeshCheckOut, ToolError> {
         *element_types.entry(t.clone()).or_default() += 1;
     }
     let parts = components(&mesh);
-    let free = free_nodes(&mesh);
+    let usage = node_usage(&mesh, &scan);
+    let joined_by = joining_cards(&scan);
     let q = quality(&mesh);
     let mass = mass_properties(&mesh, &scan);
 
@@ -156,8 +175,9 @@ pub fn check(roots: &Roots, p: MeshCheckIn) -> Result<MeshCheckOut, ToolError> {
     let problems_total = problems.len();
     let items: Vec<String> = problems.iter().take(20).map(|m| relative(roots, m)).collect();
 
-    let verdict = if parts.len() > 1
-        || !free.is_empty()
+    let unconnected = parts.len() > 1 && joined_by.is_empty();
+    let verdict = if unconnected
+        || !usage.free.is_empty()
         || !q.non_positive_volume.is_empty()
         || mass.unassigned_elements > 0
         || problems_total > 0
@@ -186,8 +206,12 @@ pub fn check(roots: &Roots, p: MeshCheckIn) -> Result<MeshCheckOut, ToolError> {
         elements: mesh.elements.len(),
         element_types,
         bounding_box: BBox { min: bb.0, max: bb.1 },
-        parts: PartsOut { count: parts.len(), largest_sizes: parts.iter().take(10).map(Vec::len).collect() },
-        free_nodes: id_list(free),
+        parts: PartsOut { count: parts.len(), largest_sizes: parts.iter().take(10).map(Vec::len).collect(), joined_by },
+        free_nodes: id_list(usage.free),
+        reference_nodes: ReferenceNodesOut {
+            count: usage.reference.len(),
+            first: usage.reference.iter().take(10).map(|(node, card)| ReferenceNode { node: *node, card: card.clone() }).collect(),
+        },
         quality: QualityOut {
             non_positive_volume: id_list(q.non_positive_volume),
             max_aspect: (q.max_aspect.is_finite() && q.max_aspect > 0.0).then_some(q.max_aspect),
@@ -207,6 +231,7 @@ pub fn check(roots: &Roots, p: MeshCheckIn) -> Result<MeshCheckOut, ToolError> {
             "Aspect is the longest over the shortest corner-node edge of an element. Only solid elements are measured.".into(),
         ]
         .into_iter()
+        .chain(unconnected.then(|| format!("{} parts and no connecting card (TIE, CONTACT PAIR, RIGID BODY, EQUATION, MPC, COUPLING): check that they are meant to be separate.", parts.len())))
         .chain((!skipped.is_empty()).then(|| format!("{} *SURFACE card(s) of TYPE=NODE are not read and not counted as problems.", skipped.len())))
         .collect(),
     })
@@ -880,6 +905,94 @@ mod tests {
         let err = select(&roots, MeshSelectIn { normal: Some(up()), ..sel("../outside.inp") }).unwrap_err();
         assert_eq!(err.code, "PATH_OUTSIDE_ROOTS");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const TWO_HEX: &str = "\
+*NODE
+1, 0, 0, 0
+2, 1, 0, 0
+3, 1, 1, 0
+4, 0, 1, 0
+5, 0, 0, 1
+6, 1, 0, 1
+7, 1, 1, 1
+8, 0, 1, 1
+11, 5, 0, 0
+12, 6, 0, 0
+13, 6, 1, 0
+14, 5, 1, 0
+15, 5, 0, 1
+16, 6, 0, 1
+17, 6, 1, 1
+18, 5, 1, 1
+100, 3, 0, 0
+101, 3, 0, 0
+*ELEMENT, TYPE=C3D8, ELSET=EALL
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 11, 12, 13, 14, 15, 16, 17, 18
+*NSET, NSET=NB
+11, 12, 13, 14, 15, 16, 17, 18
+*MATERIAL, NAME=STEEL
+*DENSITY
+7.85e-9
+*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL
+";
+
+    #[test]
+    fn parts_joined_by_rigid_body_are_ok_and_unconnected_parts_are_review() {
+        let deck = format!("{TWO_HEX}*RIGID BODY, NSET=NB, REF NODE=100, ROT NODE=101\n");
+        let (dir, roots) = setup(&deck);
+        let out = check(&roots, MeshCheckIn { path: "deck.inp".into() }).unwrap();
+        assert_eq!(out.verdict, "OK", "{:?}", serde_json::to_string(&out));
+        assert_eq!((out.parts.count, out.parts.joined_by.clone()), (2, vec!["RIGID BODY".to_string()]));
+        assert_eq!(out.free_nodes.count, 0);
+        assert_eq!(out.reference_nodes.count, 2);
+        assert_eq!(out.reference_nodes.first[0].node, 100);
+        assert_eq!(out.reference_nodes.first[0].card, "RIGID BODY");
+        assert!(!out.notes.iter().any(|n| n.contains("no connecting card")));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Same blocks, no card: the two spare nodes are free and the parts are unconnected.
+        let (dir, roots) = setup(TWO_HEX);
+        let out = check(&roots, MeshCheckIn { path: "deck.inp".into() }).unwrap();
+        assert_eq!(out.verdict, "REVIEW");
+        assert!(out.parts.joined_by.is_empty() && out.free_nodes.count == 2);
+        assert!(out.notes.iter().any(|n| n.starts_with("2 parts and no connecting card")));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Only the unconnected parts, no free nodes.
+        let deck = TWO_HEX.replace("100, 3, 0, 0\n101, 3, 0, 0\n", "");
+        let (dir, roots) = setup(&deck);
+        let out = check(&roots, MeshCheckIn { path: "deck.inp".into() }).unwrap();
+        assert_eq!((out.verdict.as_str(), out.free_nodes.count), ("REVIEW", 0));
+        assert!(out.notes.iter().any(|n| n.contains("no connecting card")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(clippy::print_stdout)]
+    fn real_decks_reference_nodes_and_parts() {
+        let base = Path::new("/Users/carlo/code/CalculiX");
+        let hinge = base.join("CalculixExamples/examples/other/Kaffeeheblerei_hinge.inp");
+        if hinge.exists() {
+            let roots = Roots::new(vec![hinge.parent().unwrap().to_path_buf()]).unwrap();
+            let out = check(&roots, MeshCheckIn { path: "Kaffeeheblerei_hinge.inp".into() }).unwrap();
+            println!("hinge: {}", serde_json::to_string(&out).unwrap());
+            assert!(out.reference_nodes.first.iter().any(|r| r.node == 380 && r.card == "RIGID BODY"));
+            // Node 379 is named only in commented-out (`***`) RIGID BODY cards: genuinely unused.
+            assert_eq!(out.free_nodes.first, vec![379]);
+            assert_eq!(out.parts.count, 2);
+            assert_eq!(out.parts.joined_by, vec!["RIGID BODY".to_string()]);
+        } else {
+            eprintln!("hinge deck not present, skipping");
+        }
+        let contact = base.join("ccx/CalculiX-CrunchiX-MultiSolver/test/contact4badnl.inp");
+        if contact.exists() {
+            let roots = Roots::new(vec![contact.parent().unwrap().to_path_buf()]).unwrap();
+            let out = check(&roots, MeshCheckIn { path: "contact4badnl.inp".into() }).unwrap();
+            println!("contact4badnl: verdict={} parts={} joined_by={:?} nonpos={:?} free={:?}", out.verdict, out.parts.count, out.parts.joined_by, out.quality.non_positive_volume.first, out.free_nodes.first);
+            assert_eq!(out.verdict, "REVIEW");
+        }
     }
 
     #[test]

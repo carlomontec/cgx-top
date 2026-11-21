@@ -419,7 +419,9 @@ pub struct CcxJobStatusOut {
     pub progress: Option<Progress>,
     /// Convergence verdict so far (same values as ccx_diagnose)
     pub verdict: Option<String>,
-    /// 'meta' and 'steps' of <job>.json once the solver has written it
+    /// 'meta' and 'steps' of <job>.json once the solver has written it. Per-node and per-element
+    /// arrays (from *NODE PRINT / *EL PRINT) are reduced to their totals and counts, at most 20 modes
+    /// and the last 5 increments per step are kept; `reduced` says what was cut
     pub telemetry: Option<Value>,
     /// Result files that exist, by kind
     pub files: Map<String, Value>,
@@ -446,7 +448,7 @@ pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatu
     });
 
     let view = JobView::of(m);
-    let verdict = (!sta.is_empty() || !cvg.is_empty()).then(|| {
+    let verdict = (!sta.is_empty() || !cvg.is_empty() || json.is_some()).then(|| {
         let json_steps = read_json(&with_ext(&base, "json")).map(|j| j.0).unwrap_or_default();
         let ctx = DiagCtx { running: view.running, exit_failed: view.failed, json_steps, stdout_tail: view.stdout_tail.clone() };
         diagnose(&sta, &cvg, &ctx, &Thresholds::default(), None, 10).verdict.as_str().to_string()
@@ -496,17 +498,85 @@ pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatu
         rss_mb: m.pid.filter(|_| m.state == State::Running).and_then(rss_mb),
         progress,
         verdict,
-        telemetry: json.map(|mut j| {
-            // ccx writes a constant 1 here regardless of the threads used; drop it rather than mislead.
-            if let Some(meta) = j["meta"].as_object_mut() {
-                meta.remove("num_threads");
-            }
-            json!({ "meta": j["meta"], "steps": j["steps"] })
-        }),
+        telemetry: json.map(compact_telemetry),
         files,
         tail,
         next: next.into(),
     }
+}
+
+const TELEMETRY_MAX_MODES: usize = 20;
+const TELEMETRY_MAX_INCREMENTS: usize = 5;
+
+/// Keep ccx's JSON telemetry small enough for a model's context. The MultiSolver JSON carries the
+/// full *NODE PRINT / *EL PRINT output (one row per node and increment), which on a real model is
+/// thousands of rows: those arrays are replaced by their length, totals are kept.
+fn compact_telemetry(mut j: Value) -> Value {
+    // ccx writes a constant 1 here regardless of the threads used; drop it rather than mislead.
+    if let Some(meta) = j["meta"].as_object_mut() {
+        meta.remove("num_threads");
+    }
+    let mut cut: Vec<String> = Vec::new();
+    let mut steps = j["steps"].take();
+    if let Some(list) = steps.as_array_mut() {
+        for step in list.iter_mut() {
+            let n = step["step_number"].as_u64().unwrap_or(0);
+            if let Some(obj) = step.as_object_mut() {
+                if let Some(Value::Array(modes)) = obj.get_mut("modes") {
+                    if modes.len() > TELEMETRY_MAX_MODES {
+                        cut.push(format!("step {}: first {} of {} modes", n, TELEMETRY_MAX_MODES, modes.len()));
+                        let total = modes.len();
+                        modes.truncate(TELEMETRY_MAX_MODES);
+                        obj.insert("modes_total".into(), json!(total));
+                    }
+                }
+                if let Some(Value::Array(incs)) = obj.get_mut("increments") {
+                    if incs.len() > TELEMETRY_MAX_INCREMENTS {
+                        cut.push(format!("step {}: last {} of {} increments", n, TELEMETRY_MAX_INCREMENTS, incs.len()));
+                        let total = incs.len();
+                        incs.drain(..total - TELEMETRY_MAX_INCREMENTS);
+                        obj.insert("increments_total".into(), json!(total));
+                    }
+                }
+            }
+            if drop_bulk_arrays(step) {
+                cut.push(format!("step {}: per-node and per-element values replaced by counts (read <job>.dat, or query the .frd)", n));
+            }
+        }
+    }
+    let mut out = json!({ "meta": j["meta"].take(), "steps": steps });
+    if !cut.is_empty() {
+        out["reduced"] = json!(cut);
+    }
+    out
+}
+
+/// Replace every array under the keys `values`, `nodes` or `elements` by `<key>_count`.
+/// Returns whether anything was replaced.
+fn drop_bulk_arrays(v: &mut Value) -> bool {
+    let mut changed = false;
+    match v {
+        Value::Object(obj) => {
+            for key in ["values", "nodes", "elements"] {
+                if let Some(Value::Array(a)) = obj.get(key) {
+                    let len = a.len();
+                    obj.remove(key);
+                    obj.insert(format!("{}_count", key), json!(len));
+                    changed = true;
+                }
+            }
+            for child in obj.values_mut() {
+                changed |= drop_bulk_arrays(child);
+            }
+        }
+        Value::Array(a) => {
+            for child in a.iter_mut() {
+                changed |= drop_bulk_arrays(child);
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -650,6 +720,39 @@ mod tests {
         assert!(broken.code == "DECK_INVALID" && broken.valid[0].contains("gone.inc"));
         assert_eq!(prepare_solve(&roots, &jobs, CcxSolveIn { inp_path: "case/local.inp".into(), solver: Some("pardiso".into()), threads: None, timeout_s: None, label: None }).err().unwrap().code, "UNKNOWN_SOLVER");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Found in a live test: a 53-node *NODE PRINT set was passed through verbatim.
+    #[test]
+    fn telemetry_is_compacted() {
+        let rows: Vec<Value> = (0..300).map(|i| json!([i as f64, 0.0, 1.0])).collect();
+        let ids: Vec<u32> = (1..=300).collect();
+        let incs: Vec<Value> = (1..=8)
+            .map(|i| json!({"increment_number": i, "node_sets": {"NFIX_RF": {"set": "NFIX", "field": "RF",
+                "components": ["fx", "fy", "fz"], "nodes": ids, "values": rows, "total": [0.0, 0.0, 25.0]}}}))
+            .collect();
+        let modes: Vec<Value> = (1..=30).map(|i| json!({"mode_number": i, "frequency_hz": i as f64})).collect();
+        let raw = json!({"meta": {"solver": "MUMPS", "num_threads": 1, "success": true},
+            "steps": [{"step_number": 1, "type": "STATIC", "converged": true, "increments": incs},
+                      {"step_number": 2, "type": "FREQUENCY", "converged": true, "modes": modes}]});
+        let raw_len = raw.to_string().len();
+        let out = compact_telemetry(raw);
+        let text = out.to_string();
+        assert!(text.len() * 10 < raw_len, "{} vs {}", text.len(), raw_len);
+        assert!(out["meta"].get("num_threads").is_none());
+        let step1 = &out["steps"][0];
+        assert_eq!((step1["increments"].as_array().unwrap().len(), step1["increments_total"].as_u64()), (5, Some(8)));
+        assert_eq!(step1["increments"][0]["increment_number"], json!(4), "the last increments are kept");
+        let set = &step1["increments"][4]["node_sets"]["NFIX_RF"];
+        assert_eq!((set["nodes_count"].as_u64(), set["values_count"].as_u64()), (Some(300), Some(300)));
+        assert_eq!(set["total"], json!([0.0, 0.0, 25.0]));
+        assert!(set.get("values").is_none() && set.get("nodes").is_none());
+        assert_eq!((out["steps"][1]["modes"].as_array().unwrap().len(), out["steps"][1]["modes_total"].as_u64()), (20, Some(30)));
+        assert_eq!(out["reduced"].as_array().unwrap().len(), 3);
+
+        // Small, flat telemetry passes through without a `reduced` note.
+        let small = compact_telemetry(json!({"meta": {"success": true}, "steps": [{"step_number": 1, "converged": true}]}));
+        assert!(small.get("reduced").is_none());
     }
 
     #[test]

@@ -47,11 +47,17 @@ for _ in range(10):
     err, st = s.call("ccx_job_status", job_id=jid, wait_s=20, tail_lines=6)
     if st["state"] not in ("QUEUED", "STARTING", "RUNNING", "CANCELLING"): break
 show("status:", st, 1500)
-show("diagnose:", s.call("ccx_diagnose", job_id=jid)[1], 500)
-if st["state"] == "SUCCEEDED":
-    frd = st["files"]["frd"]
-    show("summary:", s.call("frd_summary", path=frd)[1], 900)
-    show("query NTOP:", s.call("frd_query_set", path=frd, set="NTOP", inp_path="cube.inp", quantity="displacement", top_n=2)[1], 700)
+assert st["state"] == "SUCCEEDED", st
+diag = s.call("ccx_diagnose", job_id=jid)[1]
+show("diagnose:", diag, 500)
+assert diag["verdict"] == "LINEAR", diag
+frd = st["files"]["frd"]
+show("summary:", s.call("frd_summary", path=frd)[1], 900)
+err, query = s.call("frd_query_set", path=frd, set="NTOP", inp_path="cube.inp", quantity="displacement", top_n=2)
+show("query NTOP:", query, 700)
+# One C3D8 cube, 100 N on the top face: the result is fixed by the deck, whatever the solver.
+u_max = query["envelope"]["u_max"][0]
+assert not err and abs(u_max - 0.0018111742) < 1e-6, query
 print("original deck dir untouched:", sorted(os.listdir("target/mcp-solve/cube")), "\n")
 show("job list:", s.call("ccx_job_list", limit=5)[1])
 show("cancel finished job:", s.call("ccx_job_cancel", job_id=jid)[1])

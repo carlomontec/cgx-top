@@ -393,3 +393,61 @@ fn curved_c3d20_annulus_corner_node_approximation_error() {
     // Exact 16-gon prism shortfall is 1 - sin(pi/8)/(pi/8) ≈ 2.55%.
     assert!((rel_err - 0.0255).abs() < 0.001, "unexpected corner-node error {rel_err}");
 }
+
+/// Two separate single-hex blocks plus nodes 100, 101 (in no element), then `extra` cards.
+fn two_blocks_with(extra: &str) -> String {
+    format!(
+        "{}{}*NODE\n100, 5, 5, 5\n101, 5, 5, 5\n{}",
+        block(1, [0.0; 3], 1, 1, "Blk"),
+        block(1, [10.0, 0.0, 0.0], 20, 2, "Other"),
+        extra
+    )
+}
+
+#[test]
+fn rigid_body_reference_nodes_are_not_free() {
+    let deck = two_blocks_with("*RIGID BODY, NSET=Other, REF NODE=100, ROT NODE=101\n");
+    let (m, scan) = load(&deck);
+    let u = node_usage(&m, &scan);
+    assert!(u.free.is_empty(), "{:?}", u.free);
+    assert_eq!(u.reference, vec![(100, "RIGID BODY".to_string()), (101, "RIGID BODY".to_string())]);
+    assert_eq!(components(&m).len(), 2);
+    assert_eq!(joining_cards(&scan), vec!["RIGID BODY".to_string()]);
+}
+
+#[test]
+fn without_connection_cards_nodes_are_free_and_parts_unjoined() {
+    let (m, scan) = load(&two_blocks_with(""));
+    let u = node_usage(&m, &scan);
+    assert_eq!(u.free, vec![100, 101]);
+    assert!(u.reference.is_empty());
+    assert!(joining_cards(&scan).is_empty());
+}
+
+#[test]
+fn equation_mpc_boundary_and_coupling_make_reference_nodes() {
+    // 100 via EQUATION (two lines, three terms, the second term line has one term),
+    // 101 only via MPC; the *EQUATION first term of the second set is a node set name.
+    let deck = two_blocks_with("*EQUATION\n3\n100,1,1.,1,1,-1.,2,1,-0.5\n2\nNall,1,1.,101,2,-1.\n*MPC\nBEAM,101,1\n");
+    let (m, scan) = load(&deck);
+    let u = node_usage(&m, &scan);
+    assert!(u.free.is_empty(), "{:?}", u.free);
+    assert_eq!(u.reference, vec![(100, "EQUATION".to_string()), (101, "EQUATION".to_string())]);
+    assert_eq!(joining_cards(&scan), vec!["EQUATION".to_string(), "MPC".to_string()]);
+
+    let (m, scan) = load(&two_blocks_with("*MPC\nBEAM,100,1\n*COUPLING, REF NODE=101, SURFACE=S, CONSTRAINT NAME=C\n"));
+    let u = node_usage(&m, &scan);
+    assert_eq!(u.reference, vec![(100, "MPC".to_string()), (101, "COUPLING".to_string())]);
+
+    let (m, scan) = load(&two_blocks_with("*BOUNDARY\n100,1,3\n*CLOAD\n101,1,5.\n"));
+    let u = node_usage(&m, &scan);
+    assert_eq!(u.reference, vec![(100, "BOUNDARY".to_string()), (101, "CLOAD".to_string())]);
+}
+
+#[test]
+fn unused_node_stays_free_next_to_a_reference_node() {
+    let (m, scan) = load(&two_blocks_with("*RIGID BODY, NSET=Other, REF NODE=100\n"));
+    let u = node_usage(&m, &scan);
+    assert_eq!(u.free, vec![101]);
+    assert_eq!(u.reference, vec![(100, "RIGID BODY".to_string())]);
+}

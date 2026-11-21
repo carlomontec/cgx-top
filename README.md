@@ -1,5 +1,6 @@
 # calculix-mcp
 
+[![CI](https://github.com/carlomontec/calculix-mcp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/carlomontec/calculix-mcp-rs/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/Model_Context_Protocol-server-6E56CF.svg)](https://modelcontextprotocol.io/)
 [![CalculiX](https://img.shields.io/badge/CalculiX-native-2E7D32.svg)](http://www.calculix.de/)
