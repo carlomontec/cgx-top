@@ -339,7 +339,7 @@ fn plan_reads(
             }
             let nested = std::fs::read(&source).map_err(ToolError::internal)?;
             chain.push(source);
-            let nested_label = rel.display().to_string();
+            let nested_label = rel.display().to_string().replace('\\', "/"); // same label on every OS
             plan_reads(roots, base, top_name, &nested_label, &nested, r.kind, chain, plan)?;
             chain.pop();
         }
@@ -980,7 +980,7 @@ mod tests {
         write(&dir, "m/r.frd", "x");
         let (name, _, _, plan) = screen(&roots, &input("m/main.fbd")).unwrap();
         assert_eq!(name, "main.fbd");
-        let rels: Vec<String> = plan.files.iter().map(|(_, r)| r.display().to_string()).collect();
+        let rels: Vec<String> = plan.files.iter().map(|(_, r)| r.display().to_string().replace('\\', "/")).collect();
         assert_eq!(rels, ["parts/a.fbl", "parts/b.fbl", "mesh.inp", "nodes.inc", "r.frd"]);
 
         // A forbidden line two levels down is reported with its own file and line.
