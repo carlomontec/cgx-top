@@ -8,7 +8,7 @@
 
 **Let an AI agent work on real CalculiX models.** `calculix-mcp` is a Model Context Protocol server that gives Claude, Antigravity or any MCP client direct access to your finite-element work: it reads decks with their whole `*INCLUDE` tree, checks the mesh, selects faces by geometry, runs the solver in the background, explains convergence problems, and quotes exact results with node ids from ASCII or binary `.frd` files.
 
-It is written in Rust, works on the decks and result files you already have, and never asks the model to estimate a number it can compute.
+It is written in Rust, works on the decks and result files you already have, and never asks the model to estimate a number it can compute. The repository also includes [`cgx-top`](#cgx-top-results-in-your-terminal), a small terminal tool for checking results by hand.
 
 ```mermaid
 flowchart LR
@@ -157,21 +157,69 @@ Release build, open plus stress and displacement histories over the whole model:
 | Compressor rotor, 409 MB ASCII, 342,139 nodes | 1.97 s | 0.62 s | 808 MB to 456 MB |
 | Hammering, 89 MB binary, 366,987 nodes | 1.06 s | 0.12 s | 365 MB to 191 MB |
 
-## Also in this repository
+## cgx-top: results in your terminal
 
-The server is built on a Rust workspace that can be used on its own:
-
-| Crate | Purpose |
-|---|---|
-| [`calculix-mcp`](crates/calculix-mcp) | The MCP server |
-| `cgx-core` | Library: lazy `.frd` index (ASCII and binary), `.inp` card scanner and mesh reader, exterior faces and selections, mesh checks, `.sta`/`.cvg` parsers and convergence rules, stress invariants |
-| `cgx-top` | Terminal companion to CalculiX GraphiX: result summaries, set queries with CSV output, deck checks, convergence diagnosis and an interactive TUI |
+The repository also ships `cgx-top`, a small terminal tool for checking results by hand: no AI client and nothing to configure, and it works over SSH. It uses the same Rust library as the server.
 
 ```bash
-cgx-top --summary results.frd                      # steps, fields, extrema
-cgx-top results.frd deck.inp -S BLADE_ROOT --mises # von Mises history on a set
-cgx-top diagnose run/job                           # convergence verdict from .sta/.cvg
+cargo build --release -p cgx-top
+
+cgx-top results.frd                                 # interactive dashboard
+cgx-top --summary results.frd                       # steps, fields, sets and extrema
+cgx-top results.frd deck.inp -S BLADE_ROOT --mises  # von Mises history on a set (--principal, --disp, --csv)
+cgx-top check deck.inp                              # include tree, sets, materials
+cgx-top consolidate deck.inp                        # flatten *INCLUDE files into one deck
+cgx-top diagnose run/job                            # convergence verdict from .sta and .cvg
 ```
+
+The dashboard on a modal beam with step 3 selected (a capture of the real screen):
+
+```text
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ cgx-top │ beam_modal.frd (237.19 KB) │ Nodes: 261 Elements: 32 Steps: 5 │ Set: [[ALL NODES]] (261 nodes (all))     │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ Steps / Modes / Loads (5) [W/S, 1-9╮╭ Step Extrema & Invariant Details [Tab: All Fields] ──────────────────────────╮
+│  Step 1   (t=1.310e4) DISP         ││Step 3 │ Incr 1 │ Value: 7.693814e4 │ DISP │ Set: [[ALL NODES]] (261 nodes)  ◄│
+│  Step 2   (t=1.310e4) DISP         ││A/D cycle (0=ALL) ►                                                           │
+│▶ Step 3   (t=7.694e4) DISP         ││──────────────────────────────────────────────────────────────────────────────│
+│  Step 4   (t=7.694e4) DISP         ││● NODAL DISPLACEMENT (Field: DISP)                                            │
+│  Step 5   (t=9.357e4) DISP         ││   Peak Magnitude (ALL): 8.066241e3 at Node #8  (Min: 0.0000e0)               │
+│                                    ││   D1    min: -5.5923e3    (Node #173  )  │  max: 7.5018e3     (Node #25)     │
+│                                    ││   D2    min: -1.4282e3    (Node #7    )  │  max: 1.1808e3     (Node #55)     │
+│                                    ││   D3    min: -2.6019e3    (Node #6    )  │  max: 2.6019e3     (Node #8)      │
+│                                    ││   ALL   min: 0.0000e0     (Node #94   )  │  max: 8.0662e3     (Node #8)      │
+│                                    ││                                                                              │
+│                                    ││● CAUCHY STRESS & INVARIANTS (Field: STRESS)                                  │
+│                                    ││   von Mises: 2.214251e8 at Node #2                                           │
+│                                    ││   S1 (Max Principal): 3.6240e8     (#2)  │  S3 (Min Principal): -3.6240e8    │
+│                                    ││(#4)                                                                          │
+╰────────────────────────────────────╯╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Peak von Mises Stress History across Steps [Filter: [ALL NODES]] ──────────────────────────────────────────────────╮
+│    3.25e8 ┤                                                                                               ╭─────   │
+│           │                                                                                    ╭──────────╯        │
+│           │                                                 ╭──────────────────────────────────╯                   │
+│    1.86e8 ┤                                           ╭─────╯                                                      │
+│           │                                    ╭──────╯                                                            │
+│           │                              ╭─────╯                                                                   │
+│    4.67e7 ┤ ─────────────────────────────╯                                                                         │
+│           └─────────────────────────────────────────────────────────────────────────────────────────────────────   │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ [W/S] Step   [A/D] Rotate Set   [0] All Nodes   [1-9] Jump Step   [Space] Set List   [Tab] Field   [?] Help   [q/Esc]
+```
+
+| Key | Action |
+|---|---|
+| `W` / `S` or arrows | Previous / next step, mode or increment |
+| `A` / `D` or arrows | Previous / next node set |
+| `0` | Back to all nodes |
+| `1` to `9` | Jump to step 1 to 9 |
+| `Space` / `Enter` | Search and pick a set |
+| `Tab` | Show all fields, displacement only or stress only |
+| `g` / `G`, `PgUp` / `PgDn` | First / last step, 5 steps back / forward |
+| `?` | Help |
+| `q` / `Esc` | Quit |
+
+Both tools are built on `cgx-core`, which can also be used as a library: lazy `.frd` index (ASCII and binary), `.inp` card scanner and mesh reader, exterior faces and selections, mesh checks, `.sta`/`.cvg` parsers with the convergence rules, and stress invariants.
 
 ## Roadmap
 
