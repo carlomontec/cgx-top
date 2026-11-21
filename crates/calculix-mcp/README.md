@@ -45,7 +45,8 @@ With a stock solver, `ccx_job_status` has no `telemetry` field and carries a `no
 
 | Flag | Meaning |
 |---|---|
-| `--root DIR` | Folder with your models (`.inp` decks, include files, `.frd` results; subfolders included). The server may read everything under it. Repeatable. Default: the current directory. Job run directories are created under the first root. |
+| `--root DIR` | Optional. Pins the models folder (`.inp` decks, include files, `.frd` results; subfolders included) for the whole session; `models_folder` can then only narrow it to a folder inside. Repeatable. Without it the models folder is the client's workspace folders (MCP `roots`), else the current directory, and `models_folder` can switch it. Job run directories are created under the first folder. |
+| `--allow DIR` | Optional. `models_folder` (and the client's workspace folders) may only point inside one of these folders; otherwise it refuses with `PATH_OUTSIDE_ROOTS` and lists them. Repeatable. Ignored with `--root`. |
 | `--ccx NAME=PATH` | Solver binary: stock `ccx` (run as `-i <jobname>`) or CalculiX MultiSolver (run as `-j <jobname>`). Repeatable; the first is the default. Without it, `ccx_solve` returns `TOOL_DISABLED`; all other tools still work. |
 | `--env-passthrough NAME` | Environment variable to pass to the solver, for example `DYLD_LIBRARY_PATH`. Repeatable. |
 | `--cgx PATH` | CalculiX GraphiX binary (for example the GLFW edition), run headlessly as `cgx -bg`. Without it, `cgx_run_batch` returns `TOOL_DISABLED`; all other tools still work. |
@@ -85,6 +86,7 @@ Use absolute paths. Other MCP clients take the same command and arguments.
 
 | Tool | Description |
 |---|---|
+| `models_folder` | Show or change the folder with the user's models that all other tools work in. Without `path` it reports `folders`, `source` (`flag`, `client_roots`, `cwd`, `tool` or `none`), `fixed` and a hint; with an absolute `path` it switches. Refuses `ROOT_FIXED` outside `--root`, `PATH_OUTSIDE_ROOTS` outside `--allow`, `FOLDER_REFUSED` for refused folders. When no folder is set, every other tool except `cgx_help` and `ccx_job_cancel` returns `NO_MODELS_FOLDER`. |
 | `inp_inspect` | Summarise a CalculiX `.inp` deck across its `*INCLUDE` tree: flags, keyword census, step plan, includes (missing ones first), sets, materials. Call first on any deck. |
 | `inp_cards` | List keyword cards of a deck (for example `CONTACT PAIR`, `BOUNDARY`, `STATIC`) across its `*INCLUDE` tree, with file:line and the first data lines. |
 | `inp_consolidate` | Flatten a multi-file deck into one `.inp` file on disk. Returns statistics, never deck text. |
@@ -97,7 +99,7 @@ Use absolute paths. Other MCP clients take the same command and arguments.
 | `ccx_solve` | Start a solve in the background on a private copy of the deck. The original directory is never written to. Returns a `job_id` immediately. |
 | `ccx_job_status` | State, progress, memory, convergence verdict and result files of a job. `wait_s` blocks until the state changes instead of polling. |
 | `ccx_job_cancel` | Stop a queued or running job and remove all of its processes. Safe to call on a finished job. |
-| `ccx_job_list` | List jobs, newest first, with state, jobname, label, elapsed seconds and run directory size. Includes finished jobs from earlier server runs. Filter with `state`. |
+| `ccx_job_list` | List jobs, newest first, with state, jobname, label, elapsed seconds and run directory size: the jobs of the models folder (also finished ones from earlier server runs) and every job started in this session, whichever folder it runs in. Filter with `state`. |
 | `ccx_diagnose` | Explain convergence from `.sta`/`.cvg`/`.json`. Give `job_id` for a job started by `ccx_solve`, or `job_path` for any job directory. |
 | `frd_summary` | Steps, frequencies or times, available fields and whole-model peak displacement and von Mises stress (with node ids) of an `.frd` file. Call before `frd_query_set`. |
 | `frd_sets` | List node and element sets usable in `frd_query_set`, with sizes. Supports a substring filter; pass `inp_path` to add the deck's sets. |
@@ -320,11 +322,13 @@ The lazy figure for resident memory is mostly memory-mapped file pages, which th
 
 ## Safety model
 
-- **Root confinement.** Every path argument is resolved against `--root` and must stay inside a root. Paths that escape through `..` or symlinks are rejected.
-- **Isolated run directory.** `ccx_solve` copies the deck and every file it includes or references into `<root>/.calculix-mcp/runs/<job_id>/` and runs the solver there. The original directory is not written to. Files outside the deck's directory are rejected with a hint to use `inp_consolidate`. Run directories are never deleted by the server.
+- **Folder confinement.** Every path argument is resolved against the active models folder and must stay inside it. Paths that escape through `..` or symlinks are rejected.
+- **Refused folders.** The root of a file system (`/`, `C:\`), the user's home folder itself and system folders (`/Users`, `/home`, `/usr`, `/etc`, `/System`, `C:\Users`, `C:\Windows`, `C:\Program Files`, ...) are never used as the models folder, whether they come from `--root`, the client, the current directory or `models_folder`; a client that starts the server in `/` gets no folder (`NO_MODELS_FOLDER`) until the user names one. Folders inside them are fine.
+- **Where the folder may move.** `--root` fixes it (narrowing to a subfolder only, `ROOT_FIXED` otherwise); `--allow DIR` limits switching to folders inside the given ones. Every change is logged to stderr.
+- **Isolated run directory.** `ccx_solve` copies the deck and every file it includes or references into `<models folder>/.calculix-mcp/runs/<job_id>/` and runs the solver there. The original directory is not written to. Files outside the deck's directory are rejected with a hint to use `inp_consolidate`. Run directories are never deleted by the server.
 - **No shell.** The solver is started with an explicit argument vector (`<binary> -j <jobname>`, or `-i <jobname>` for stock ccx); no argument is passed through a shell, and the solver binary can only be one of those named with `--ccx`.
 - **Cleared environment.** The solver gets `PATH`, a private `HOME` and `TMPDIR`, `LANG` and `LC_ALL` set to `C`, the thread-count variables, and any names given with `--env-passthrough`. Nothing else is inherited.
-- **Process-group cleanup.** Each solver leads its own process group. Cancel, timeout and server shutdown send SIGTERM to the group, wait 5 seconds, send SIGKILL, reap the child, and send SIGKILL to the group once more. After a server crash, the next start marks orphaned jobs `LOST` and kills the old process only if its recorded start time still matches.
+- **Process-group cleanup.** Each solver leads its own process group. Cancel, timeout and server shutdown send SIGTERM to the group, wait 5 seconds, send SIGKILL, reap the child, and send SIGKILL to the group once more. After a server crash, the next server to use that models folder marks orphaned jobs `LOST` and kills the old process only if its recorded start time still matches; jobs of another server that is still running are left alone.
 - **One job at a time.** Up to 8 further jobs wait in a queue.
 - **Disk quota.** A job whose run directory exceeds `--max-run-gb` (default 50 GiB) is killed and marked failed with `DISK_QUOTA`.
 

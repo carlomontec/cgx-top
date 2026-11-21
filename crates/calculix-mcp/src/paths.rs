@@ -20,6 +20,11 @@ impl Roots {
         &self.0[0]
     }
 
+    /// The canonical folders; the first one hosts run directories.
+    pub fn all(&self) -> &[PathBuf] {
+        &self.0
+    }
+
     /// Path shown to the model: relative to the root that contains it.
     pub fn display(&self, path: &Path) -> String {
         self.0
@@ -82,6 +87,75 @@ impl Roots {
             .ok_or_else(|| ToolError::new("FILE_NOT_FOUND", format!("parent directory of {} does not exist", raw)))?;
         self.confine(parent.join(name), exts)
     }
+}
+
+/// The user's home folder, canonicalised (`HOME`, or `USERPROFILE` on Windows).
+pub fn home_dir() -> Option<PathBuf> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var).filter(|v| !v.is_empty()).and_then(|v| PathBuf::from(v).canonicalize().ok())
+}
+
+/// Folders that are never a models folder themselves (folders inside them may be).
+#[cfg(not(windows))]
+const SYSTEM_DIRS: &[&str] = &[
+    "/Users", "/home", "/root", "/tmp", "/var", "/var/tmp", "/private", "/private/var", "/private/tmp", "/Volumes",
+    "/mnt", "/media", "/opt", "/srv", "/run", "/snap", "/Applications", "/Library", "/Network", "/cores",
+];
+/// Folders that are refused together with everything inside them.
+#[cfg(not(windows))]
+const SYSTEM_TREES: &[&str] = &[
+    "/System", "/bin", "/sbin", "/usr", "/etc", "/private/etc", "/dev", "/proc", "/sys", "/boot", "/lib", "/lib32",
+    "/lib64", "/libx32",
+];
+/// Windows: compared case-insensitively with the path stripped of its drive (`C:`).
+#[cfg(windows)]
+const SYSTEM_DIRS: &[&str] = &[r"\Users", r"\Users\Public", r"\Users\Default"];
+#[cfg(windows)]
+const SYSTEM_TREES: &[&str] =
+    &[r"\Windows", r"\Program Files", r"\Program Files (x86)", r"\ProgramData", r"\$Recycle.Bin", r"\System Volume Information"];
+
+/// A comparable spelling of a path: no `\\?\` prefix, no trailing separator; on Windows without
+/// the drive letter, with `\` separators and in lower case. Lower case on macOS too, whose
+/// default file system ignores case.
+fn comparable(path: &Path) -> String {
+    let mut s = path.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = rest.to_string();
+    }
+    if cfg!(windows) {
+        s = s.replace('/', r"\");
+        if s.len() >= 2 && s.as_bytes()[1] == b':' {
+            s = s[2..].to_string();
+        }
+    }
+    while s.len() > 1 && (s.ends_with('/') || s.ends_with('\\')) {
+        s.pop();
+    }
+    if cfg!(any(windows, target_os = "macos")) {
+        s = s.to_lowercase();
+    }
+    s
+}
+
+/// Why the canonical `path` can never be a models folder, or None when it can be: the root of
+/// a file system (`/`, `C:\`), the user's home folder itself, or a system folder.
+pub fn refusal(path: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if path.parent().is_none() {
+        return Some("it is the root of the file system");
+    }
+    let c = comparable(path);
+    if home.is_some_and(|h| comparable(h) == c) {
+        return Some("it is the home folder itself; use a project folder inside it");
+    }
+    let norm = |d: &str| comparable(Path::new(d));
+    let in_tree = |d: &str| {
+        let d = norm(d);
+        c == d || c.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with(['/', '\\']))
+    };
+    if SYSTEM_DIRS.iter().any(|d| c == norm(d)) || SYSTEM_TREES.iter().any(|d| in_tree(d)) {
+        return Some("it is a system folder");
+    }
+    None
 }
 
 fn has_ext(path: &Path, exts: &[&str]) -> bool {

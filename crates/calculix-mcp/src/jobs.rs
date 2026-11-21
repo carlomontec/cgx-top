@@ -90,6 +90,10 @@ pub struct Manifest {
     pub signal: Option<i32>,
     /// SPAWN | EXIT_CODE | SIGNAL | SOLVER_REPORTED | TIMEOUT | DISK_QUOTA | LOST, with detail
     pub failure: Option<String>,
+    /// Process id of the server that started the job; the reaper of another server leaves the
+    /// job alone while that server is alive
+    #[serde(default)]
+    pub server_pid: Option<u32>,
 }
 
 impl Manifest {
@@ -298,7 +302,9 @@ pub struct Prepared {
 }
 
 struct Inner {
-    runs_dir: PathBuf,
+    /// `<models folder>/.calculix-mcp/runs` of every models folder active so far, the most
+    /// recently activated last
+    runs_dirs: Mutex<Vec<PathBuf>>,
     solvers: Vec<Solver>,
     env_passthrough: Vec<String>,
     grace: Duration,
@@ -312,10 +318,10 @@ struct Inner {
 pub struct JobManager(Arc<Inner>);
 
 impl JobManager {
-    /// `root` hosts `.calculix-mcp/runs/`. Runs the reaper before returning.
-    pub fn new(root: &Path, solvers: Vec<Solver>, env_passthrough: Vec<String>, grace: Duration) -> Self {
-        let manager = Self(Arc::new(Inner {
-            runs_dir: root.join(".calculix-mcp").join("runs"),
+    /// A manager with no models folder yet; see `activate`.
+    pub fn detached(solvers: Vec<Solver>, env_passthrough: Vec<String>, grace: Duration) -> Self {
+        Self(Arc::new(Inner {
+            runs_dirs: Mutex::new(Vec::new()),
             solvers,
             env_passthrough,
             grace,
@@ -323,9 +329,38 @@ impl JobManager {
             quota_interval: QUOTA_INTERVAL,
             jobs: Mutex::new(HashMap::new()),
             slot: Arc::new(Semaphore::new(1)),
-        }));
-        manager.reap();
+        }))
+    }
+
+    #[cfg(test)]
+    /// A manager for the models folder `root` (which hosts `.calculix-mcp/runs/`). Runs the
+    /// reaper before returning.
+    pub fn new(root: &Path, solvers: Vec<Solver>, env_passthrough: Vec<String>, grace: Duration) -> Self {
+        let manager = Self::detached(solvers, env_passthrough, grace);
+        manager.activate(root);
         manager
+    }
+
+    fn runs_dir(root: &Path) -> PathBuf {
+        root.join(".calculix-mcp").join("runs")
+    }
+
+    /// Note that `root` is now the models folder. The first time a folder becomes active its
+    /// orphaned jobs are reaped; its finished jobs stay addressable by id for the whole session.
+    /// Blocking (the reaper may wait for a killed process group).
+    pub fn activate(&self, root: &Path) {
+        let runs = Self::runs_dir(root);
+        {
+            let mut dirs = self.0.runs_dirs.lock().unwrap();
+            let seen = dirs.iter().position(|d| *d == runs);
+            if let Some(i) = seen {
+                let d = dirs.remove(i);
+                dirs.push(d);
+                return;
+            }
+            dirs.push(runs.clone());
+        }
+        self.reap(&runs);
     }
 
     /// Set the run-directory size limit and how often it is checked. Call right after `new`.
@@ -354,8 +389,11 @@ impl JobManager {
         }
     }
 
-    /// Reserve a fresh job id and create its run directory (with a private `tmp/`).
-    pub fn new_run_dir(&self) -> Result<(String, PathBuf), ToolError> {
+    /// Reserve a fresh job id and create its run directory (with a private `tmp/`) under the
+    /// models folder `root`.
+    pub fn new_run_dir(&self, root: &Path) -> Result<(String, PathBuf), ToolError> {
+        self.activate(root);
+        let runs_dir = Self::runs_dir(root);
         let waiting = self.0.jobs.lock().unwrap().values().filter(|j| j.snapshot().state == State::Queued).count();
         if waiting >= MAX_QUEUE {
             return Err(ToolError::new("QUEUE_FULL", format!("{} jobs are already queued", waiting))
@@ -364,7 +402,7 @@ impl JobManager {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         for salt in 0..100u32 {
             let id = format!("j{}-{:04x}", now(), (nanos ^ std::process::id()).wrapping_add(salt) & 0xffff);
-            let dir = self.0.runs_dir.join(&id);
+            let dir = runs_dir.join(&id);
             if !dir.exists() {
                 std::fs::create_dir_all(dir.join("tmp")).map_err(ToolError::internal)?;
                 return Ok((id, dir));
@@ -397,6 +435,7 @@ impl JobManager {
             exit_code: None,
             signal: None,
             failure: None,
+            server_pid: Some(std::process::id()),
         };
         write_manifest(&manifest);
         let job = Arc::new(Job {
@@ -413,31 +452,40 @@ impl JobManager {
         self.0.jobs.lock().unwrap().get(id).cloned()
     }
 
-    /// Current manifest of a job from this server run, or of a finished one found on disk.
+    /// Runs directories of the models folders active so far, the most recent first.
+    fn known_runs_dirs(&self) -> Vec<PathBuf> {
+        self.0.runs_dirs.lock().unwrap().iter().rev().cloned().collect()
+    }
+
+    /// Current manifest of a job from this server run, or of a finished one found on disk in
+    /// any models folder that was active during this session.
     pub fn get(&self, id: &str) -> Result<Manifest, ToolError> {
         if let Some(job) = self.live(id) {
             return Ok(job.snapshot());
         }
         let safe = !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        safe.then(|| read_manifest(&self.0.runs_dir.join(id))).flatten().ok_or_else(|| {
-            let mut ids: Vec<String> = std::fs::read_dir(&self.0.runs_dir)
-                .into_iter()
-                .flatten()
-                .flatten()
+        let dirs = self.known_runs_dirs();
+        safe.then(|| dirs.iter().find_map(|d| read_manifest(&d.join(id)))).flatten().ok_or_else(|| {
+            let mut ids: Vec<String> = dirs
+                .iter()
+                .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
                 .filter_map(|e| e.file_name().into_string().ok())
+                .chain(self.0.jobs.lock().unwrap().keys().cloned())
                 .collect();
             ids.sort_by(|a, b| b.cmp(a)); // ids start with a timestamp: newest first
+            ids.dedup();
             ToolError::new("UNKNOWN_JOB", format!("no job '{}'", id)).valid(ids).hint("valid lists the most recent job ids.")
         })
     }
 
-    /// Every job with a manifest on disk (live ones from memory), newest first, optionally only
-    /// those in `state`. Returns the page of `offset..offset+limit` and the total that matched.
-    pub fn list(&self, state: Option<State>, offset: usize, limit: usize) -> (Vec<Manifest>, usize) {
-        let mut all: Vec<Manifest> = std::fs::read_dir(&self.0.runs_dir)
+    /// The jobs of models folder `root` with a manifest on disk (live ones from memory), plus every
+    /// job this server started in another folder, newest first, optionally only those in `state`.
+    /// Returns the page of `offset..offset+limit` and the total that matched.
+    pub fn list(&self, root: Option<&Path>, state: Option<State>, offset: usize, limit: usize) -> (Vec<Manifest>, usize) {
+        let on_disk: Vec<Manifest> = root
+            .map(|r| std::fs::read_dir(Self::runs_dir(r)).into_iter().flatten().flatten().collect::<Vec<_>>())
+            .unwrap_or_default()
             .into_iter()
-            .flatten()
-            .flatten()
             .filter_map(|e| {
                 let id = e.file_name().into_string().ok()?;
                 match self.live(&id) {
@@ -445,8 +493,15 @@ impl JobManager {
                     None => read_manifest(&e.path()),
                 }
             })
-            .filter(|m| state.is_none_or(|s| m.state == s))
             .collect();
+        let session: Vec<Manifest> = self.0.jobs.lock().unwrap().values().map(|j| j.snapshot()).collect();
+        let mut all = on_disk;
+        for m in session {
+            if !all.iter().any(|a| a.job_id == m.job_id) {
+                all.push(m);
+            }
+        }
+        let mut all: Vec<Manifest> = all.into_iter().filter(|m| state.is_none_or(|s| m.state == s)).collect();
         all.sort_by(|a, b| (b.created, &b.job_id).cmp(&(a.created, &a.job_id)));
         let total = all.len();
         (all.into_iter().skip(offset).take(limit).collect(), total)
@@ -488,11 +543,15 @@ impl JobManager {
     }
 
     /// Mark jobs orphaned by a previous server as LOST, killing their process group when the
-    /// recorded pid is alive and has the recorded start time.
-    fn reap(&self) {
-        for entry in std::fs::read_dir(&self.0.runs_dir).into_iter().flatten().flatten() {
+    /// recorded pid is alive and has the recorded start time. Jobs of this server, and jobs of
+    /// another server that is still running, are left alone.
+    fn reap(&self, runs_dir: &Path) {
+        for entry in std::fs::read_dir(runs_dir).into_iter().flatten().flatten() {
             let Some(mut m) = read_manifest(&entry.path()) else { continue };
-            if m.state.terminal() {
+            if m.state.terminal() || self.live(&m.job_id).is_some() {
+                continue;
+            }
+            if m.server_pid.is_some_and(|owner| owner != std::process::id() && alive(owner)) {
                 continue;
             }
             if let Some(pid) = m.pid {
@@ -738,7 +797,7 @@ esac
         }
 
         fn start_with(&self, solver: Option<&str>, mode: &str, timeout_s: u64) -> String {
-            let (job_id, run_dir) = self.manager.new_run_dir().unwrap();
+            let (job_id, run_dir) = self.manager.new_run_dir(&self.dir).unwrap();
             std::fs::write(run_dir.join("deck.inp"), format!("** MODE={}\n*STEP\n*STATIC\n*END STEP\n", mode)).unwrap();
             let s = self.manager.solver(solver).unwrap();
             let p = Prepared {
@@ -911,13 +970,13 @@ esac
         write_manifest(&old);
 
         let fresh = JobManager::new(&b.dir, Vec::new(), Vec::new(), Duration::from_millis(100));
-        let (all, total) = fresh.list(None, 0, 10);
+        let (all, total) = fresh.list(Some(&b.dir), None, 0, 10);
         assert_eq!((total, all.iter().map(|m| m.job_id.as_str()).collect::<Vec<_>>()), (2, vec![fail.as_str(), ok.as_str()]));
-        let (failed, n) = fresh.list(Some(State::Failed), 0, 10);
+        let (failed, n) = fresh.list(Some(&b.dir), Some(State::Failed), 0, 10);
         assert_eq!((n, failed[0].job_id.as_str()), (1, fail.as_str()));
-        let (page, n) = fresh.list(None, 1, 1);
+        let (page, n) = fresh.list(Some(&b.dir), None, 1, 1);
         assert_eq!((n, page.len(), page[0].job_id.as_str()), (2, 1, ok.as_str()));
-        assert_eq!(fresh.list(Some(State::Running), 0, 10).1, 0);
+        assert_eq!(fresh.list(Some(&b.dir), Some(State::Running), 0, 10).1, 0);
     }
 
     #[tokio::test]
@@ -929,7 +988,7 @@ esac
             write_manifest(&Manifest {
                 job_id: name.into(), state: State::Running, label: None, jobname: "deck".into(), solver: "fake".into(),
                 threads: 1, argv: Vec::new(), telemetry_source: TelemetrySource::Json, run_dir, source_inp: PathBuf::new(), timeout_s: 1, pid: Some(pid),
-                proc_start: start, created: 0, started: Some(0), ended: None, exit_code: None, signal: None, failure: None,
+                proc_start: start, created: 0, started: Some(0), ended: None, exit_code: None, signal: None, failure: None, server_pid: None,
             });
         };
         let spawn = || {
@@ -951,5 +1010,49 @@ esac
         assert!(reused.try_wait().unwrap().is_none(), "a pid with a different start time is left alone");
         reused.kill().unwrap();
         reused.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn jobs_stay_addressable_after_a_folder_switch() {
+        let b = bench("switch");
+        let other = b.dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let id = b.start("ok", 30);
+        b.manager.activate(&other);
+        assert_eq!(b.until(&id, State::terminal).await.state, State::Succeeded);
+        // Listed in the new folder as a job of this session; the new folder has its own runs.
+        let (listed, _) = b.manager.list(Some(&other), None, 0, 10);
+        assert_eq!(listed.iter().map(|m| m.job_id.as_str()).collect::<Vec<_>>(), [id.as_str()]);
+        let (_, there) = b.manager.new_run_dir(&other).unwrap();
+        assert!(there.starts_with(other.join(".calculix-mcp/runs")));
+
+        // A later server that saw both folders finds the finished job on disk.
+        let fresh = JobManager::new(&other, Vec::new(), Vec::new(), Duration::from_millis(100));
+        assert_eq!(fresh.get(&id).unwrap_err().code, "UNKNOWN_JOB");
+        fresh.activate(&b.dir);
+        fresh.activate(&other);
+        assert_eq!(fresh.get(&id).unwrap().state, State::Succeeded);
+        assert_eq!(fresh.list(Some(&other), None, 0, 10).1, 0, "the job lives in the first folder; a new server lists by folder");
+    }
+
+    #[test]
+    fn reaper_spares_jobs_of_another_running_server() {
+        let b = bench("owner");
+        let mut sleeper = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let run_dir = b.dir.join(".calculix-mcp/runs/j9-other");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let m = Manifest {
+            job_id: "j9-other".into(), state: State::Running, label: None, jobname: "deck".into(), solver: "fake".into(),
+            threads: 1, argv: Vec::new(), telemetry_source: TelemetrySource::Json, run_dir, source_inp: PathBuf::new(), timeout_s: 1,
+            pid: None, proc_start: None, created: 0, started: Some(0), ended: None, exit_code: None, signal: None, failure: None,
+            server_pid: Some(sleeper.id()),
+        };
+        write_manifest(&m);
+        let manager = JobManager::new(&b.dir, Vec::new(), Vec::new(), Duration::from_millis(100));
+        assert_eq!(manager.get("j9-other").unwrap().state, State::Running);
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        let later = JobManager::new(&b.dir, Vec::new(), Vec::new(), Duration::from_millis(100));
+        assert_eq!(later.get("j9-other").unwrap().state, State::Lost);
     }
 }

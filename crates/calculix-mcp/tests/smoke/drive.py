@@ -6,7 +6,9 @@ Run from the workspace root after `cargo build -p calculix-mcp`:
 Works with a CalculiX MultiSolver build (telemetry_source "json") and with stock ccx
 (telemetry_source "sta_cvg"); the assertions that only JSON can satisfy branch on it.
 It solves a one-element cube in an isolated run directory, queries the results, then checks
-that a client disconnect kills a hanging (fake) solver. Scratch files go to target/mcp-solve.
+that a client disconnect kills a hanging (fake) solver, and finally that without --root the
+models folder is the current directory and can be switched with models_folder. Scratch files go
+to target/mcp-solve.
 """
 import shutil, stat
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -19,8 +21,8 @@ os.chmod("target/mcp-solve/hang/fake_ccx", 0o755)
 with open("target/mcp-solve/hang/h.inp", "w") as f: f.write("*STEP\n*STATIC\n*END STEP\n")
 
 class Server:
-    def __init__(self, args):
-        self.p = subprocess.Popen(["./target/debug/calculix-mcp"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    def __init__(self, args, cwd=None):
+        self.p = subprocess.Popen([os.path.abspath("target/debug/calculix-mcp")] + args, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.n = 0
         self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "drive", "version": "0"}})
         self.p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"); self.p.stdin.flush()
@@ -93,3 +95,18 @@ except ProcessLookupError: alive = False
 man = json.load(open(glob.glob("target/mcp-solve/hang/.calculix-mcp/runs/*/manifest.json")[0]))
 assert not alive and man["state"] == "CANCELLED"
 print("after disconnect: server exit", h.p.returncode, "in %.1fs," % (time.time() - t), "solver alive:", alive, "manifest state:", man["state"])
+
+# No --root: the models folder is the directory the client started the server in, and
+# models_folder switches it. This client declares no roots capability, so cwd applies.
+cube, hang = os.path.realpath("target/mcp-solve/cube"), os.path.realpath("target/mcp-solve/hang")
+f = Server([], cwd=cube)
+err, here = f.call("models_folder"); show("models_folder:", here)
+assert not err and here["source"] == "cwd" and here["folders"] == [cube] and here["fixed"] is False, here
+err, there = f.call("models_folder", path=hang); show("models_folder switch:", there)
+assert not err and there["source"] == "tool" and there["folders"] == [hang], there
+err, deck = f.call("inp_inspect", path="h.inp")
+assert not err, deck  # relative paths now resolve in the new folder
+err, refused = f.call("models_folder", path="/")
+assert err and refused["code"] == "FOLDER_REFUSED", refused
+f.p.stdin.close(); f.p.wait(timeout=20)
+print("models folder: cwd", cube, "-> tool", hang, "; '/' refused")

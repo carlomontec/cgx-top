@@ -64,6 +64,21 @@ Full transcripts with the raw tool output are in [`crates/calculix-mcp/README.md
 - Builds geometry and meshes through CalculiX GraphiX, finds contact pairs, and edits decks only by writing new files.
 - Returns exact values with node ids, plus notes when a number needs context.
 
+## Works best with CalculiX MultiSolver
+
+`calculix-mcp` runs with stock CalculiX, but it gets more out of [CalculiX MultiSolver](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver), which writes a structured JSON report of every run (`-j`). With stock CalculiX the server has to work from the solver's text output; with MultiSolver the solver states the facts itself, so the agent reports them instead of inferring them:
+
+| What the agent can tell you | Stock CalculiX | CalculiX MultiSolver |
+|---|---|---|
+| Did the run succeed? | Exit code and `*ERROR` lines | Explicit success flag, plus the same checks |
+| Did each step converge, and what type was it? | Inferred from `.sta` and `.cvg` | Reported per step by the solver |
+| Eigenfrequencies and effective modal mass | Frequencies from the `.frd` after the run | Mode table with frequencies and effective mass in the run report |
+| Reaction-force totals of `*NODE PRINT` sets | Only in the `.dat` text | Totals per increment in the run report |
+| Solver used, wall time, model size | Not available | Solver name, wall time, nodes, elements and equations |
+| Convergence diagnosis | From `.sta` and `.cvg` | Same, cross-checked with the per-step flags |
+
+MultiSolver also replaces the legacy SPOOLES solver: on the compressor rotor benchmark (38,408 equations, Apple M3), Apple Accelerate and MUMPS finish in about 6 s against 13 s for SPOOLES, about 2.2 times faster ([its benchmarks](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver/blob/main/benchmarks/README.md)). Stock CalculiX stays fully supported and is tested in CI.
+
 ## Install and connect
 
 ### 1. Build
@@ -78,12 +93,19 @@ The server is `target/release/calculix-mcp`. You need a Rust toolchain, and for 
 
 ### 2. Connect your AI client
 
-Two flags matter: `--root` is the folder with your models (`.inp` decks, their include files and `.frd` results, subfolders included); the server may read everything under it and only ever adds new files there, and `--ccx NAME=PATH` registers a solver binary, stock `ccx` or a MultiSolver build. At startup the server checks which one it is and logs it to stderr; a MultiSolver binary is run as `-j <job>` and a stock one as `-i <job>`. Repeat `--ccx` to offer several (for example `accelerate`, `spooles`, `mumps`, or `ccx=/usr/bin/ccx`); the first is the default. Add `--cgx PATH` (a CalculiX GraphiX binary, for example the GLFW edition) to enable geometry and meshing. Use absolute paths.
+`--ccx NAME=PATH` registers a solver binary, stock `ccx` or a MultiSolver build. At startup the server checks which one it is and logs it to stderr; a MultiSolver binary is run as `-j <job>` and a stock one as `-i <job>`. Repeat `--ccx` to offer several (for example `accelerate`, `spooles`, `mumps`, or `ccx=/usr/bin/ccx`); the first is the default. Add `--cgx PATH` (a CalculiX GraphiX binary, for example the GLFW edition) to enable geometry and meshing. Use absolute paths.
+
+**Register once; the models folder follows your project.** The models folder holds your `.inp` decks, their include files and `.frd` results (subfolders included); the server reads everything under it and only ever adds new files there. You do not have to name it:
+
+- Claude Code and the `agy` CLI start the server in the folder you opened, and that folder is used.
+- Clients that report their workspace folders (the MCP `roots` feature) get those folders, and the server follows when you open another one.
+- Otherwise, just tell the assistant where the models are ("my models are in /path/to/project"); it calls `models_folder` to switch.
+- The root of the disk, your home folder itself and system folders are never used, so a client that starts the server in `/` gets no folder until you name one.
 
 **Claude Code**: register once from a terminal:
 
 ```bash
-claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/path/to/my-models --ccx mumps=/abs/path/to/CalculiX
+claude mcp add --scope user calculix -- /abs/path/to/calculix-mcp --ccx mumps=/abs/path/to/CalculiX
 ```
 
 or put this in a `.mcp.json` file at the root of your project, to share the setup with the project:
@@ -94,7 +116,7 @@ or put this in a `.mcp.json` file at the root of your project, to share the setu
     "calculix": {
       "type": "stdio",
       "command": "/abs/path/to/calculix-mcp",
-      "args": ["--root", "/abs/path/to/my-models", "--ccx", "mumps=/abs/path/to/CalculiX"]
+      "args": ["--ccx", "mumps=/abs/path/to/CalculiX"]
     }
   }
 }
@@ -102,13 +124,15 @@ or put this in a `.mcp.json` file at the root of your project, to share the setu
 
 Check that it is connected with `/mcp` inside Claude Code.
 
+Optional: `--root /abs/path/to/my-models` pins the models folder for the whole session (the assistant can then only narrow it to a subfolder), for example `"args": ["--root", "/abs/path/to/my-models", "--ccx", "mumps=/abs/path/to/CalculiX"]`. `--allow /abs/path/to/projects` (repeatable) lets the folder follow you but only inside those folders.
+
 **Antigravity**: add the same `mcpServers` block to `~/.gemini/config/mcp_config.json`, then reload the MCP servers in Antigravity.
 
 Claude Desktop reads the same block from its `claude_desktop_config.json`; this setup has not been tested yet.
 
 ### 3. Talk to it
 
-Ask in plain language; the agent picks the tools. Paths are relative to `--root`.
+Ask in plain language; the agent picks the tools. Paths are relative to the models folder.
 
 ```text
 What does run/bracket.inp do? Any missing includes?
@@ -118,7 +142,7 @@ Solve run/bracket.inp with mumps and tell me when it is done.
 What is the peak von Mises stress on set FILLET, and at which nodes?
 ```
 
-The server never edits your deck: selections go to new include files, and solves run on a copy in `<root>/.calculix-mcp/runs/`.
+The server never edits your deck: selections go to new include files, and solves run on a copy in `<models folder>/.calculix-mcp/runs/`.
 
 ### Platforms
 
@@ -130,6 +154,7 @@ All flags are documented in the [server README](crates/calculix-mcp/README.md#ru
 
 | Stage | Tool | What it does |
 |---|---|---|
+| Setup | `models_folder` | Show or change the folder with your models that all other tools work in |
 | Decks | `inp_inspect` | Summary of a deck across its `*INCLUDE` tree: flags, keyword census, step plan, includes, sets, materials |
 | | `inp_cards` | Specific keyword cards with file, line and data lines, without loading the whole deck |
 | | `inp_consolidate` | Flatten a multi-file deck into one file |

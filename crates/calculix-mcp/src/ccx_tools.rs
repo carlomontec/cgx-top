@@ -339,7 +339,7 @@ pub fn prepare_solve(roots: &Roots, jobs: &JobManager, p: CcxSolveIn) -> Result<
         None
     };
 
-    let (job_id, run_dir) = jobs.new_run_dir()?;
+    let (job_id, run_dir) = jobs.new_run_dir(roots.first())?;
     let mut copied = 0;
     for (source, rel, inlinable) in &files {
         let target = match (&consolidated, rel) {
@@ -633,11 +633,11 @@ pub struct CcxJobListOut {
     pub page: Page,
 }
 
-/// Jobs of this server run and finished ones found on disk. Blocking (measures run directories).
-pub fn job_list(jobs: &JobManager, p: CcxJobListIn) -> CcxJobListOut {
+/// Jobs of the models folder `root` (also finished ones on disk) and every job of this server run. Blocking (measures run directories).
+pub fn job_list(jobs: &JobManager, root: &Path, p: CcxJobListIn) -> CcxJobListOut {
     let limit = p.limit.unwrap_or(10).clamp(1, 50);
     let offset = p.offset.unwrap_or(0);
-    let (found, total) = jobs.list(p.state, offset, limit);
+    let (found, total) = jobs.list(Some(root), p.state, offset, limit);
     let rows = found
         .iter()
         .map(|m| {

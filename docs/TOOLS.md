@@ -1,11 +1,12 @@
-# The 17 tools of calculix-mcp
+# The 18 tools of calculix-mcp
 
-These tools let an AI assistant read, check, edit and solve CalculiX models for you. You talk to the assistant in plain language and it picks the tools; you never call them by hand. Paths are relative to `--root`, the folder that holds your models. The examples below were run for real; numbers are shortened and are in deck units.
+These tools let an AI assistant read, check, edit and solve CalculiX models for you. You talk to the assistant in plain language and it picks the tools; you never call them by hand. Paths are relative to the models folder, the folder that holds your models (see `models_folder`). The examples below were run for real; numbers are shortened and are in deck units.
 
 ## Overview
 
 | Group | Tool | In one line |
 |---|---|---|
+| Setup | `models_folder` | Show or switch the folder with your models |
 | Decks | `inp_inspect` | Summary of a deck and its includes: flags, steps, sets, materials |
 | | `inp_cards` | Show specific keyword cards with file and line |
 | | `inp_consolidate` | Flatten a multi-file deck into one file |
@@ -23,6 +24,21 @@ These tools let an AI assistant read, check, edit and solve CalculiX models for 
 | Results | `frd_summary` | Steps, fields and whole-model peaks of a result file |
 | | `frd_sets` | List the sets you can query |
 | | `frd_query_set` | Exact stress or displacement values on one set |
+
+## Setup
+
+### `models_folder`
+**What it's for.** Shows which folder the other tools work in, and switches to another one when you name it. Without `--root` the server starts in the folder your client opened (or the workspace folders it reports), so you rarely need it.
+
+**Try:** "My models are in /Users/me/projects/bracket." or "Which folder are you working in?"
+
+**You get:** First `source: "cwd"` with `folders: [".../mcp-solve/cube"]` (the folder the client started the server in), then after the switch `source: "tool"` with `folders: [".../mcp-solve/hang"]` and the hint "Paths in other tools are relative to .../mcp-solve/hang."
+
+**Good to know:**
+- `source` says where the folder came from: `flag` (`--root`), `client_roots`, `cwd`, `tool` or `none`.
+- The root of the disk, your home folder itself and system folders are refused. If the client started the server in one of them, the other tools answer `NO_MODELS_FOLDER` until you name a folder.
+- With `--root` the folder is fixed (`fixed: true`); only a subfolder can be chosen, otherwise `ROOT_FIXED`. With `--allow` only folders inside the allowed ones are accepted.
+- Jobs started before a switch keep running and stay reachable by `job_id`.
 
 ## Decks
 
@@ -251,4 +267,4 @@ Needs `--ccx`. Solves run on a private copy of the deck in `<root>/.calculix-mcp
 
 - Install and connect: see "Install and connect" in the [README](../README.md#install-and-connect); all flags are in the [server README](../crates/calculix-mcp/README.md#run-and-flags).
 - `--ccx NAME=PATH` enables solving (`ccx_solve`, the job tools, `ccx_diagnose` on live jobs); `--cgx PATH` enables geometry and meshing (`cgx_run_batch`).
-- Everything else, including `cgx_help`, `.inp` tools, mesh tools and `frd_*`, needs only `--root`.
+- Everything else, including `.inp` tools, mesh tools and `frd_*`, needs only a models folder; `cgx_help` needs nothing.

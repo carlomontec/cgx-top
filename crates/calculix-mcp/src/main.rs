@@ -8,6 +8,7 @@ mod cgx_tools;
 mod contact_tools;
 mod edit_tools;
 mod error;
+mod folder;
 mod frd_tools;
 mod inp_tools;
 mod jobs;
@@ -22,9 +23,13 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Directory the server may read and write. Repeatable. Default: current directory
+    /// Pin the models folder for the whole session (repeatable; models_folder can then only narrow to a folder inside one). Default: the client's workspace folders, else the current directory
     #[arg(long = "root", value_name = "DIR")]
     roots: Vec<PathBuf>,
+
+    /// Restrict where models_folder (and the client's workspace folders) may point: only inside one of these folders. Repeatable. Default: anywhere except the file-system root, the home folder itself and system folders
+    #[arg(long = "allow", value_name = "DIR")]
+    allow: Vec<PathBuf>,
 
     /// Solver binary as <name>=<path>, e.g. --ccx mumps=/opt/ccx/build_mumps/CalculiX or --ccx ccx=/usr/bin/ccx. Stock ccx and CalculiX MultiSolver both work (MultiSolver adds JSON telemetry). Repeatable; the first is the default
     #[arg(long = "ccx", value_name = "NAME=PATH")]
@@ -98,9 +103,15 @@ async fn stop_signal() {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let roots = if args.roots.is_empty() { vec![std::env::current_dir()?] } else { args.roots };
-    let roots = paths::Roots::new(roots)?;
-    eprintln!("calculix-mcp {}: serving on stdio, root {}", env!("CARGO_PKG_VERSION"), roots.first().display());
+    let folder = folder::ModelsFolder::new(args.roots.clone(), args.allow.clone(), std::env::current_dir().ok(), paths::home_dir())?;
+    eprintln!("calculix-mcp {}: serving on stdio", env!("CARGO_PKG_VERSION"));
+    let start = folder.view();
+    if start.folders.is_empty() {
+        eprintln!("models folder: none ({})", start.hint);
+    } else {
+        eprintln!("models folder: {} [source {}]", start.folders.join(", "), folder::source_name(start.source));
+    }
+    let folder = std::sync::Arc::new(folder);
 
     let solvers = parse_solvers(&args.ccx)?;
     if solvers.is_empty() {
@@ -111,10 +122,14 @@ async fn main() -> anyhow::Result<()> {
     }
     anyhow::ensure!(args.max_run_gb.is_finite() && args.max_run_gb > 0.0, "--max-run-gb must be a positive number");
     let max_run_bytes = (args.max_run_gb * 1024.0 * 1024.0 * 1024.0) as u64;
-    let jobs = jobs::JobManager::new(roots.first(), solvers, args.env_passthrough.clone(), std::time::Duration::from_secs(5))
+    let jobs = jobs::JobManager::detached(solvers, args.env_passthrough.clone(), std::time::Duration::from_secs(5))
         .with_disk_limit(max_run_bytes, std::time::Duration::from_secs(10));
+    // The reaper runs for the folder known at startup, and later for each newly active folder.
+    if let Ok(roots) = folder.current() {
+        jobs.activate(roots.first());
+    }
 
-    let mut server = server::CalculixServer::new(roots, jobs.clone());
+    let mut server = server::CalculixServer::new(folder, jobs.clone());
     match &args.cgx {
         Some(path) => {
             let binary = parse_cgx(path)?;
