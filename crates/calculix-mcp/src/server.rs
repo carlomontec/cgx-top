@@ -3,13 +3,13 @@
 use crate::error::ToolError;
 use crate::jobs::JobManager;
 use crate::paths::Roots;
-use crate::{ccx_tools, frd_tools, inp_tools, mesh_tools};
+use crate::{ccx_tools, cgx_tools, contact_tools, edit_tools, frd_tools, inp_tools, mesh_tools};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{tool, tool_handler, tool_router, Json, ServerHandler};
 use std::sync::Arc;
 
-const INSTRUCTIONS: &str = "Native CalculiX tools. Decks: inp_inspect, then inp_cards to read specific cards; inp_consolidate to flatten. Mesh: mesh_check before a long solve (parts, free nodes, inverted elements, volume, mass, undefined sets), mesh_select to find and save faces by geometry as a *SURFACE or *NSET include file. Solving: ccx_solve starts a background job, ccx_job_status (wait_s=30) follows it, ccx_job_cancel stops it, ccx_job_list lists recent jobs (also finished ones on disk), ccx_diagnose explains convergence. Results: frd_summary first, \
+const INSTRUCTIONS: &str = "Native CalculiX tools. Decks: inp_inspect, then inp_cards to read specific cards; inp_consolidate to flatten, inp_edit to change a deck (new files, diff and re-check; never in place). Mesh: mesh_check before a long solve (parts, free nodes, inverted elements, volume, mass, undefined sets), mesh_select to find and save faces by geometry as a *SURFACE or *NSET include file, mesh_contact_pairs to find faces of different parts that face each other within a gap and save them as slave/master surfaces with a contact-card template. Solving: ccx_solve starts a background job, ccx_job_status (wait_s=30) follows it, ccx_job_cancel stops it, ccx_job_list lists recent jobs (also finished ones on disk), ccx_diagnose explains convergence. Geometry and meshing: cgx_help for command syntax, then cgx_run_batch runs a CalculiX GraphiX script headlessly and summarises the meshes it writes. Results: frd_summary first, \
 then frd_sets and frd_query_set for exact per-set values. Paths are relative to the server root. \
 Never estimate stresses, displacements or frequencies; query them.";
 
@@ -17,6 +17,7 @@ Never estimate stresses, displacements or frequencies; query them.";
 pub struct CalculixServer {
     roots: Arc<Roots>,
     jobs: JobManager,
+    cgx: Option<Arc<cgx_tools::CgxConfig>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -35,7 +36,31 @@ async fn blocking<T: Send + 'static>(
 #[tool_router(router = tool_router)]
 impl CalculixServer {
     pub fn new(roots: Roots, jobs: JobManager) -> Self {
-        Self { roots: Arc::new(roots), jobs, tool_router: Self::tool_router() }
+        Self { roots: Arc::new(roots), jobs, cgx: None, tool_router: Self::tool_router() }
+    }
+
+    /// Enable cgx_run_batch with this CGX binary.
+    pub fn with_cgx(mut self, cgx: cgx_tools::CgxConfig) -> Self {
+        self.cgx = Some(Arc::new(cgx));
+        self
+    }
+
+    #[tool(
+        name = "cgx_run_batch",
+        description = "Run a CalculiX GraphiX (.fbd) script headlessly to build geometry and meshes, in a private run directory. Returns the files produced and a summary of each mesh. Call cgx_help first for command syntax. The script is screened for shell and path-escaping commands; this is a mitigation, not a sandbox.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn cgx_run_batch(&self, Parameters(p): Parameters<cgx_tools::CgxRunIn>) -> Result<Json<cgx_tools::CgxRunOut>, ToolError> {
+        cgx_tools::run_batch(self.roots.clone(), self.cgx.clone(), p).await.map(Json)
+    }
+
+    #[tool(
+        name = "cgx_help",
+        description = "CalculiX GraphiX command reference with verified examples for geometry, meshing, sets and export.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn cgx_help(&self, Parameters(p): Parameters<cgx_tools::CgxHelpIn>) -> Result<Json<cgx_tools::CgxHelpOut>, ToolError> {
+        Ok(Json(cgx_tools::help(p)))
     }
 
     #[tool(
@@ -113,6 +138,15 @@ impl CalculixServer {
     }
 
     #[tool(
+        name = "inp_edit",
+        description = "Edit a CalculiX deck by addressing keyword cards (set or remove a parameter, replace data lines, insert or delete a card, append a step). Writes the result to new files and returns a diff and a re-check; the original deck and its includes are never modified. Use dry_run to preview.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false)
+    )]
+    async fn inp_edit(&self, Parameters(p): Parameters<edit_tools::InpEditIn>) -> Result<Json<edit_tools::InpEditOut>, ToolError> {
+        blocking(&self.roots, move |r| edit_tools::edit(r, p)).await
+    }
+
+    #[tool(
         name = "mesh_check",
         description = "Check a CalculiX deck's mesh before solving: disconnected parts, free nodes, inverted elements, worst aspect ratios, volume, mass and centre of gravity per material, undefined or empty sets. Call before a long solve.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -128,6 +162,15 @@ impl CalculixServer {
     )]
     async fn mesh_select(&self, Parameters(p): Parameters<mesh_tools::MeshSelectIn>) -> Result<Json<mesh_tools::MeshSelectOut>, ToolError> {
         blocking(&self.roots, move |r| mesh_tools::select(r, p)).await
+    }
+
+    #[tool(
+        name = "mesh_contact_pairs",
+        description = "Find faces of different parts of a CalculiX mesh that face each other within a gap (contact candidates), with gaps, areas and a suggested slave/master side; optionally save both surfaces and a contact-card template. Never edits the deck.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
+    )]
+    async fn mesh_contact_pairs(&self, Parameters(p): Parameters<contact_tools::MeshContactIn>) -> Result<Json<contact_tools::MeshContactOut>, ToolError> {
+        blocking(&self.roots, move |r| contact_tools::contact_pairs(r, p)).await
     }
 
     #[tool(

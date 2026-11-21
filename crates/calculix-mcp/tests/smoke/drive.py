@@ -2,7 +2,9 @@ import json, subprocess, sys, os, time, glob
 """End-to-end smoke test of calculix-mcp over stdio with a real ccx binary.
 
 Run from the workspace root after `cargo build -p calculix-mcp`:
-    python3 crates/calculix-mcp/tests/smoke/drive.py /abs/path/to/ccx_binary
+    python3 crates/calculix-mcp/tests/smoke/drive.py [name=]/abs/path/to/ccx_binary
+Works with a CalculiX MultiSolver build (telemetry_source "json") and with stock ccx
+(telemetry_source "sta_cvg"); the assertions that only JSON can satisfy branch on it.
 It solves a one-element cube in an isolated run directory, queries the results, then checks
 that a client disconnect kills a hanging (fake) solver. Scratch files go to target/mcp-solve.
 """
@@ -48,9 +50,20 @@ for _ in range(10):
     if st["state"] not in ("QUEUED", "STARTING", "RUNNING", "CANCELLING"): break
 show("status:", st, 1500)
 assert st["state"] == "SUCCEEDED", st
+src = st["telemetry_source"]
+assert src == job["telemetry_source"] and src in ("json", "sta_cvg"), (src, job)
+print("telemetry_source:", src, "\n")
+if src == "json":
+    assert "json" in st["files"] and st["telemetry"]["meta"]["success"] is True and not st.get("notes"), st
+else:
+    # Stock ccx writes no <job>.json: the status says so instead of staying silent.
+    assert "json" not in st["files"] and st["telemetry"] is None, st
+    assert len(st["notes"]) == 1 and st["notes"][0].startswith("Stock CalculiX: no JSON telemetry"), st
+    assert st["progress"]["increments_done"] >= 1, st
 diag = s.call("ccx_diagnose", job_id=jid)[1]
 show("diagnose:", diag, 500)
 assert diag["verdict"] == "LINEAR", diag
+assert diag["coverage"]["json"] == (src == "json") and diag["coverage"]["sta_rows"] >= 1, diag
 frd = st["files"]["frd"]
 show("summary:", s.call("frd_summary", path=frd)[1], 900)
 err, query = s.call("frd_query_set", path=frd, set="NTOP", inp_path="cube.inp", quantity="displacement", top_n=2)
@@ -59,7 +72,9 @@ show("query NTOP:", query, 700)
 u_max = query["envelope"]["u_max"][0]
 assert not err and abs(u_max - 0.0018111742) < 1e-6, query
 print("original deck dir untouched:", sorted(os.listdir("target/mcp-solve/cube")), "\n")
-show("job list:", s.call("ccx_job_list", limit=5)[1])
+jobs = s.call("ccx_job_list", limit=5)[1]
+show("job list:", jobs)
+assert jobs["jobs"]["columns"][-1] == "telemetry_source" and jobs["jobs"]["rows"][0][-1] == src, jobs
 show("cancel finished job:", s.call("ccx_job_cancel", job_id=jid)[1])
 show("unknown job:", s.call("ccx_job_status", job_id="j0-dead")[1])
 s.p.stdin.close(); s.p.wait(timeout=20)

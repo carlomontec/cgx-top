@@ -45,6 +45,26 @@ impl State {
     }
 }
 
+/// Where a job's telemetry comes from. `Json`: a CalculiX MultiSolver build run with `-j`, which
+/// writes `<job>.json`. `StaCvg`: stock ccx, which offers only `<job>.sta` and `<job>.cvg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetrySource {
+    /// Manifests written before stock ccx was supported all come from JSON-capable builds
+    #[default]
+    Json,
+    StaCvg,
+}
+
+/// A configured solver binary and what it can do.
+#[derive(Debug, Clone)]
+pub struct Solver {
+    pub name: String,
+    pub path: PathBuf,
+    /// The binary supports `-j` JSON telemetry (CalculiX MultiSolver)
+    pub json: bool,
+}
+
 /// Everything known about a job; persisted as `manifest.json` in its run directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -55,6 +75,8 @@ pub struct Manifest {
     pub solver: String,
     pub threads: usize,
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub telemetry_source: TelemetrySource,
     pub run_dir: PathBuf,
     pub source_inp: PathBuf,
     pub timeout_s: u64,
@@ -136,6 +158,65 @@ pub fn alive(_pid: u32) -> bool {
     false
 }
 
+/// Remove whatever is left in the process group of a leader that has already exited.
+pub fn kill_group(pid: Option<u32>) {
+    signal_group(pid, KILL);
+}
+
+/// A command whose child runs isolated: cleared environment with only `PATH`, a private
+/// `HOME`/`TMPDIR`/`TEMP` (`private_tmp`), the C locale, then `extra_env`, then the `passthrough`
+/// variables of the server's own environment; stdin from the null device; leader of its own process
+/// group on Unix; killed if the handle is dropped. The caller adds arguments, stdout and stderr.
+pub fn isolated_command(
+    binary: &Path,
+    cwd: &Path,
+    private_tmp: &Path,
+    extra_env: &[(&str, &str)],
+    passthrough: &[String],
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.current_dir(cwd)
+        .env_clear()
+        .env("PATH", if cfg!(windows) { r"C:\Windows\System32" } else { "/usr/bin:/bin" })
+        .env("HOME", private_tmp)
+        .env("TMPDIR", private_tmp)
+        .env("TEMP", private_tmp)
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    for (name, value) in extra_env {
+        cmd.env(name, value);
+    }
+    for name in passthrough {
+        if let Ok(value) = std::env::var(name) {
+            cmd.env(name, value);
+        }
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
+/// Stop the process group led by `child` (pid `pid`): SIGTERM to the group, wait up to `grace`,
+/// then SIGKILL; always reap the leader (no zombie), then SIGKILL the group once more because
+/// members that ignored SIGTERM may outlive the leader. Returns the leader's exit status if known.
+pub async fn terminate_group(child: &mut tokio::process::Child, pid: Option<u32>, grace: Duration) -> Option<std::process::ExitStatus> {
+    signal_group(pid, TERM);
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+    let status = match tokio::time::timeout(grace, child.wait()).await {
+        Ok(status) => status.ok(),
+        Err(_) => {
+            signal_group(pid, KILL);
+            let _ = child.start_kill();
+            child.wait().await.ok()
+        }
+    };
+    signal_group(pid, KILL);
+    status
+}
+
 /// Total size in bytes of the regular files under `dir` (symlinks are not followed).
 pub fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
@@ -209,6 +290,8 @@ pub struct Prepared {
     pub jobname: String,
     pub solver: String,
     pub binary: PathBuf,
+    /// The solver supports `-j` JSON telemetry
+    pub json: bool,
     pub threads: usize,
     pub timeout_s: u64,
     pub label: Option<String>,
@@ -216,7 +299,7 @@ pub struct Prepared {
 
 struct Inner {
     runs_dir: PathBuf,
-    solvers: Vec<(String, PathBuf)>,
+    solvers: Vec<Solver>,
     env_passthrough: Vec<String>,
     grace: Duration,
     max_run_bytes: u64,
@@ -230,7 +313,7 @@ pub struct JobManager(Arc<Inner>);
 
 impl JobManager {
     /// `root` hosts `.calculix-mcp/runs/`. Runs the reaper before returning.
-    pub fn new(root: &Path, solvers: Vec<(String, PathBuf)>, env_passthrough: Vec<String>, grace: Duration) -> Self {
+    pub fn new(root: &Path, solvers: Vec<Solver>, env_passthrough: Vec<String>, grace: Duration) -> Self {
         let manager = Self(Arc::new(Inner {
             runs_dir: root.join(".calculix-mcp").join("runs"),
             solvers,
@@ -254,18 +337,18 @@ impl JobManager {
     }
 
     pub fn solver_names(&self) -> Vec<String> {
-        self.0.solvers.iter().map(|s| s.0.clone()).collect()
+        self.0.solvers.iter().map(|s| s.name.clone()).collect()
     }
 
     /// Resolve a solver name (None = first configured) to its binary.
-    pub fn solver(&self, name: Option<&str>) -> Result<(String, PathBuf), ToolError> {
+    pub fn solver(&self, name: Option<&str>) -> Result<Solver, ToolError> {
         if self.0.solvers.is_empty() {
             return Err(ToolError::new("TOOL_DISABLED", "no solver binary is configured")
                 .hint("Start the server with --ccx <name>=<absolute path to the ccx binary>."));
         }
         match name {
             None => Ok(self.0.solvers[0].clone()),
-            Some(n) => self.0.solvers.iter().find(|s| s.0.eq_ignore_ascii_case(n)).cloned().ok_or_else(|| {
+            Some(n) => self.0.solvers.iter().find(|s| s.name.eq_ignore_ascii_case(n)).cloned().ok_or_else(|| {
                 ToolError::new("UNKNOWN_SOLVER", format!("no solver named '{}'", n)).valid(self.solver_names())
             }),
         }
@@ -296,7 +379,10 @@ impl JobManager {
             job_id: p.job_id.clone(),
             state: State::Queued,
             label: p.label,
-            argv: vec![p.binary.display().to_string(), "-j".into(), p.jobname.clone()],
+            // `-j <job>` for MultiSolver (JSON telemetry; the job name is a bare argument), the
+            // classic `-i <job>` for stock ccx. MultiSolver accepts `-i` too but would not write JSON.
+            argv: vec![p.binary.display().to_string(), if p.json { "-j" } else { "-i" }.into(), p.jobname.clone()],
+            telemetry_source: if p.json { TelemetrySource::Json } else { TelemetrySource::StaCvg },
             jobname: p.jobname,
             solver: p.solver,
             threads: p.threads,
@@ -433,7 +519,7 @@ enum Outcome {
 }
 
 /// Resolves when `dir` is larger than `limit` bytes, checking every `interval`.
-async fn over_quota(dir: PathBuf, limit: u64, interval: Duration) -> (u64, u64) {
+pub async fn over_quota(dir: PathBuf, limit: u64, interval: Duration) -> (u64, u64) {
     loop {
         tokio::time::sleep(interval).await;
         let d = dir.clone();
@@ -470,35 +556,18 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
 
     let tmp = m.run_dir.join("tmp");
     let threads = m.threads.to_string();
-    let mut cmd = tokio::process::Command::new(&binary);
-    cmd.args(&m.argv[1..])
-        .current_dir(&m.run_dir)
-        .env_clear()
-        .env("PATH", if cfg!(windows) { r"C:\Windows\System32" } else { "/usr/bin:/bin" })
-        .env("HOME", &tmp)
-        .env("TMPDIR", &tmp)
-        .env("TEMP", &tmp)
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        // MultiSolver reads the thread count from the environment only (src/nonlingeo.c,
-        // mafillsmmain.c, mumps.c, ...): a CCX_NPROC_* variable wins for its stage, otherwise
-        // OMP_NUM_THREADS applies, always capped at the detected CPU count. The linear solver
-        // itself is fixed by the binary and the deck's `SOLVER=` parameter, not by the environment.
-        .env("OMP_NUM_THREADS", &threads)
-        .env("CCX_NPROC_EQUATION_SOLVER", &threads)
-        .env("CCX_NPROC_STIFFNESS", &threads)
-        .env("CCX_NPROC_RESULTS", &threads)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr)
-        .kill_on_drop(true);
-    for name in &inner.env_passthrough {
-        if let Ok(value) = std::env::var(name) {
-            cmd.env(name, value);
-        }
-    }
-    #[cfg(unix)]
-    cmd.process_group(0);
+    // MultiSolver reads the thread count from the environment only (src/nonlingeo.c,
+    // mafillsmmain.c, mumps.c, ...): a CCX_NPROC_* variable wins for its stage, otherwise
+    // OMP_NUM_THREADS applies, always capped at the detected CPU count. The linear solver
+    // itself is fixed by the binary and the deck's `SOLVER=` parameter, not by the environment.
+    let thread_env = [
+        ("OMP_NUM_THREADS", threads.as_str()),
+        ("CCX_NPROC_EQUATION_SOLVER", threads.as_str()),
+        ("CCX_NPROC_STIFFNESS", threads.as_str()),
+        ("CCX_NPROC_RESULTS", threads.as_str()),
+    ];
+    let mut cmd = isolated_command(&binary, &m.run_dir, &tmp, &thread_env, &inner.env_passthrough);
+    cmd.args(&m.argv[1..]).stdout(stdout).stderr(stderr);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -525,25 +594,13 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
     match outcome {
         Outcome::Exited(status) => {
             // The leader is gone; remove anything it left behind in its group.
-            signal_group(pid, KILL);
+            kill_group(pid);
             let (state, code, signal, failure) = classify(status, &m);
             job.finish(state, code, signal, failure);
         }
         Outcome::Cancelled | Outcome::TimedOut | Outcome::DiskQuota(..) => {
             job.update(|m| m.state = State::Cancelling);
-            signal_group(pid, TERM);
-            #[cfg(not(unix))]
-            let _ = child.start_kill();
-            let status = match tokio::time::timeout(inner.grace, child.wait()).await {
-                Ok(status) => status.ok(),
-                Err(_) => {
-                    signal_group(pid, KILL);
-                    let _ = child.start_kill();
-                    child.wait().await.ok() // always reap: no zombie
-                }
-            };
-            // Group members that ignored SIGTERM may outlive the leader.
-            signal_group(pid, KILL);
+            let status = terminate_group(&mut child, pid, inner.grace).await;
             let (code, signal) = status.map(exit_parts).unwrap_or((None, None));
             match outcome {
                 Outcome::TimedOut => job.finish(State::TimedOut, code, signal, Some(format!("TIMEOUT: exceeded {} s", m.timeout_s))),
@@ -559,7 +616,7 @@ async fn supervise(inner: Arc<Inner>, job: Arc<Job>, binary: PathBuf) {
     }
 }
 
-fn exit_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) {
+pub fn exit_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) {
     #[cfg(unix)]
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
     #[cfg(not(unix))]
@@ -580,12 +637,19 @@ fn classify(status: std::io::Result<std::process::ExitStatus>, m: &Manifest) -> 
     if code != Some(0) {
         return (State::Failed, code, signal, Some(format!("EXIT_CODE: solver exited with {}", code.unwrap_or(-1))));
     }
-    // Exit 0: the MultiSolver build must have written <job>.json (`-j`). Without it the
-    // server cannot tell success from failure, which usually means a stock ccx was configured.
+    if m.telemetry_source == TelemetrySource::StaCvg {
+        // Stock ccx has no machine-readable verdict: success is exit 0 and no `*ERROR` line.
+        return match first_error_line(&m.run_dir) {
+            Some(line) => (State::Failed, code, signal, Some(format!("SOLVER_REPORTED: {}", line))),
+            None => (State::Succeeded, code, signal, None),
+        };
+    }
+    // Exit 0 from a JSON-capable build: it must have written <job>.json (`-j`). Without it the
+    // server cannot tell success from failure, so this is suspicious.
     let json_path = m.run_dir.join(format!("{}.json", m.jobname));
     let Ok(text) = std::fs::read_to_string(&json_path) else {
         return (State::Failed, code, signal, Some(
-            "SOLVER_NO_JSON: the solver exited 0 but wrote no <job>.json. --ccx must point to a CalculiX MultiSolver build that supports `-j` JSON telemetry; stock ccx is not supported.".into()));
+            "SOLVER_NO_JSON: the solver exited 0 but wrote no <job>.json although it was started with -j. It was classified as a CalculiX MultiSolver build; if it is a wrapper around stock ccx, point --ccx at the stock binary directly.".into()));
     };
     let reported_failure = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
@@ -596,21 +660,46 @@ fn classify(status: std::io::Result<std::process::ExitStatus>, m: &Manifest) -> 
     (State::Succeeded, code, signal, None)
 }
 
+/// First line containing `*ERROR` in stdout.log or stderr.log of a run, trimmed.
+fn first_error_line(run_dir: &Path) -> Option<String> {
+    use std::io::BufRead;
+    for name in ["stdout.log", "stderr.log"] {
+        let Ok(file) = std::fs::File::open(run_dir.join(name)) else { continue };
+        let mut reader = std::io::BufReader::new(file);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    if line.contains("*ERROR") {
+                        return Some(line.trim().chars().take(300).collect());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     const FAKE_SOLVER: &str = r#"#!/bin/sh
-# Fake ccx: argv is "-j <jobname>"; behaviour is chosen by a "** MODE=<mode>" line in the deck.
+# Fake ccx: argv is "-j <jobname>" (JSON-capable) or "-i <jobname>" (stock); behaviour is chosen by a "** MODE=<mode>" line in the deck.
 job="$2"
 mode=$(sed -n 's/^\*\* MODE=//p' "$job.inp" | head -1)
 printf '  STEP      INC     ATT  ITRS     TOT TIME     STEP TIME      INC TIME\n     1          1     1     1  0.100000E+01  0.100000E+01  0.100000E+01\n' > "$job.sta"
+echo "args=$*"
 echo "fake solver mode=$mode threads=$OMP_NUM_THREADS home=$HOME"
 case "$mode" in
   ok)   echo '{"meta":{"success":true},"steps":[{"step_number":1,"converged":true}]}' > "$job.json"; exit 0 ;;
   bad)  echo '{"meta":{"success":false},"steps":[{"step_number":1,"converged":false}]}' > "$job.json"; exit 0 ;;
   nojson) exit 0 ;;
+  stockerr) echo " *ERROR in fake: element type not known"; echo " *ERROR in fake: second line"; exit 0 ;;
   fail) echo " *ERROR in fake: boom"; exit 201 ;;
   hang) sleep 300 ;;
   flood) while :; do head -c 65536 /dev/zero >> flood.bin; sleep 0.02; done ;;
@@ -623,6 +712,14 @@ esac
         manager: JobManager,
     }
 
+    /// The same fake script registered as a JSON-capable solver and as a stock one.
+    fn solvers(path: &Path) -> Vec<Solver> {
+        vec![
+            Solver { name: "fake".into(), path: path.to_path_buf(), json: true },
+            Solver { name: "stock".into(), path: path.to_path_buf(), json: false },
+        ]
+    }
+
     fn bench(tag: &str) -> Bench {
         let dir = std::env::temp_dir().join(format!("calculix-mcp-jobs-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -631,18 +728,22 @@ esac
         let solver = dir.join("fake_ccx");
         std::fs::write(&solver, FAKE_SOLVER).unwrap();
         std::fs::set_permissions(&solver, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let manager = JobManager::new(&dir, vec![("fake".into(), solver)], Vec::new(), Duration::from_millis(400));
+        let manager = JobManager::new(&dir, solvers(&solver), Vec::new(), Duration::from_millis(400));
         Bench { dir, manager }
     }
 
     impl Bench {
         fn start(&self, mode: &str, timeout_s: u64) -> String {
+            self.start_with(None, mode, timeout_s)
+        }
+
+        fn start_with(&self, solver: Option<&str>, mode: &str, timeout_s: u64) -> String {
             let (job_id, run_dir) = self.manager.new_run_dir().unwrap();
             std::fs::write(run_dir.join("deck.inp"), format!("** MODE={}\n*STEP\n*STATIC\n*END STEP\n", mode)).unwrap();
-            let (solver, binary) = self.manager.solver(None).unwrap();
+            let s = self.manager.solver(solver).unwrap();
             let p = Prepared {
                 job_id: job_id.clone(), source_inp: run_dir.join("deck.inp"), run_dir, jobname: "deck".into(),
-                solver, binary, threads: 3, timeout_s, label: None,
+                solver: s.name, binary: s.path, json: s.json, threads: 3, timeout_s, label: None,
             };
             self.manager.launch(p);
             job_id
@@ -700,6 +801,41 @@ esac
     }
 
     #[tokio::test]
+    async fn stock_solver_is_judged_by_exit_code_and_error_lines() {
+        let b = bench("stock");
+        let ok = b.until(&b.start_with(Some("stock"), "nojson", 30), State::terminal).await;
+        assert_eq!((ok.state, ok.exit_code, ok.failure.as_deref()), (State::Succeeded, Some(0), None));
+        assert_eq!(ok.telemetry_source, TelemetrySource::StaCvg);
+        assert!(!ok.base().with_extension("json").exists());
+
+        let err = b.until(&b.start_with(Some("stock"), "stockerr", 30), State::terminal).await;
+        assert_eq!((err.state, err.exit_code), (State::Failed, Some(0)));
+        assert_eq!(err.failure.as_deref(), Some("SOLVER_REPORTED: *ERROR in fake: element type not known"));
+
+        let fail = b.until(&b.start_with(Some("stock"), "fail", 30), State::terminal).await;
+        assert_eq!((fail.state, fail.exit_code), (State::Failed, Some(201)));
+        assert!(fail.failure.unwrap().starts_with("EXIT_CODE"));
+
+        // The JSON-capable solver keeps its stricter rule for the very same behaviour.
+        let json = b.until(&b.start_with(Some("fake"), "nojson", 30), State::terminal).await;
+        assert_eq!(json.telemetry_source, TelemetrySource::Json);
+        assert!(json.failure.unwrap().starts_with("SOLVER_NO_JSON"));
+    }
+
+    #[tokio::test]
+    async fn argv_is_dash_i_for_stock_and_dash_j_for_json() {
+        let b = bench("argv");
+        let stock = b.until(&b.start_with(Some("stock"), "nojson", 30), State::terminal).await;
+        let json = b.until(&b.start_with(Some("fake"), "ok", 30), State::terminal).await;
+        assert_eq!(&stock.argv[1..], ["-i", "deck"]);
+        assert_eq!(&json.argv[1..], ["-j", "deck"]);
+        // What the process really received, as echoed by the fake solver.
+        let seen = |m: &Manifest| std::fs::read_to_string(m.run_dir.join("stdout.log")).unwrap();
+        assert!(seen(&stock).contains("args=-i deck\n"), "{}", seen(&stock));
+        assert!(seen(&json).contains("args=-j deck\n"), "{}", seen(&json));
+    }
+
+    #[tokio::test]
     async fn cancel_kills_the_whole_group_even_if_it_ignores_sigterm() {
         let b = bench("cancel");
         let id = b.start("stubborn", 30);
@@ -747,7 +883,7 @@ esac
     async fn disk_quota_kills_the_job_and_fails_it() {
         let mut b = bench("quota");
         let solver = b.dir.join("fake_ccx");
-        b.manager = JobManager::new(&b.dir, vec![("fake".into(), solver)], Vec::new(), Duration::from_millis(400))
+        b.manager = JobManager::new(&b.dir, solvers(&solver), Vec::new(), Duration::from_millis(400))
             .with_disk_limit(200 * 1024, Duration::from_millis(100));
         // A job that stays small is left alone.
         let small = b.until(&b.start("ok", 30), State::terminal).await;
@@ -792,7 +928,7 @@ esac
             std::fs::create_dir_all(&run_dir).unwrap();
             write_manifest(&Manifest {
                 job_id: name.into(), state: State::Running, label: None, jobname: "deck".into(), solver: "fake".into(),
-                threads: 1, argv: Vec::new(), run_dir, source_inp: PathBuf::new(), timeout_s: 1, pid: Some(pid),
+                threads: 1, argv: Vec::new(), telemetry_source: TelemetrySource::Json, run_dir, source_inp: PathBuf::new(), timeout_s: 1, pid: Some(pid),
                 proc_start: start, created: 0, started: Some(0), ended: None, exit_code: None, signal: None, failure: None,
             });
         };

@@ -4,7 +4,7 @@
 use crate::error::ToolError;
 use crate::frd_tools::{num, Page, Table};
 use crate::paths::Roots;
-use crate::jobs::{dir_size, rss_mb, JobManager, Manifest, Prepared, State};
+use crate::jobs::{dir_size, rss_mb, JobManager, Manifest, Prepared, Solver, State, TelemetrySource};
 use cgx_core::{consolidate_inp, diagnose, parse_cvg, parse_sta, scan_cards, DiagCtx, ScanLimits, Thresholds};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,7 @@ pub struct JobView {
     pub running: bool,
     pub failed: bool,
     pub stdout_tail: String,
+    pub telemetry_source: TelemetrySource,
 }
 
 impl JobView {
@@ -108,6 +109,7 @@ impl JobView {
             running: !m.state.terminal(),
             failed: matches!(m.state, State::Failed | State::TimedOut),
             stdout_tail: tail_text(&m.run_dir.join("stdout.log"), 200, 16 * 1024).unwrap_or_default(),
+            telemetry_source: m.telemetry_source,
         }
     }
 }
@@ -144,6 +146,7 @@ pub fn run_diagnose(roots: &Roots, p: CcxDiagnoseIn, job: Option<JobView>) -> Re
     let read = |ext: &str| std::fs::read_to_string(with_ext(&base, ext)).ok();
     let (sta_text, cvg_text) = (read("sta"), read("cvg"));
     let telemetry = read_json(&with_ext(&base, "json"));
+    let stock_job = job.as_ref().is_some_and(|j| j.telemetry_source == TelemetrySource::StaCvg);
 
     if sta_text.is_none() && cvg_text.is_none() && telemetry.is_none() {
         // List the jobs that do exist in that directory, closest names first.
@@ -201,7 +204,11 @@ pub fn run_diagnose(roots: &Roots, p: CcxDiagnoseIn, job: Option<JobView>) -> Re
 
     let mut notes = vec!["Thresholds are heuristics calibrated on synthetic cases plus a few real contact runs; treat WARN findings as leads, not proof.".to_string()];
     if telemetry.is_none() {
-        notes.push("No <job>.json found (run ccx with -j for per-step convergence flags).".into());
+        if stock_job {
+            notes.push("Stock CalculiX: no JSON telemetry; this diagnosis uses .sta/.cvg only.".into());
+        } else {
+            notes.push("No <job>.json found: per-step convergence flags are not available. The CalculiX MultiSolver build writes it when run with -j.".into());
+        }
     }
 
     Ok(CcxDiagnoseOut {
@@ -256,6 +263,9 @@ pub struct CcxSolveOut {
     pub run_dir: String,
     pub jobname: String,
     pub solver: String,
+    /// json: CalculiX MultiSolver, per-step convergence, timings and mode tables in <job>.json.
+    /// sta_cvg: stock CalculiX, progress and diagnosis from .sta/.cvg only
+    pub telemetry_source: TelemetrySource,
     pub threads: usize,
     pub files_copied: usize,
     pub flags: Vec<String>,
@@ -272,7 +282,7 @@ fn valid_jobname(name: &str) -> bool {
 /// Preflight the deck and copy it, with every file it references, into a fresh run directory.
 /// Blocking. The original deck directory is never written to.
 pub fn prepare_solve(roots: &Roots, jobs: &JobManager, p: CcxSolveIn) -> Result<(Prepared, usize, Vec<String>), ToolError> {
-    let (solver, binary) = jobs.solver(p.solver.as_deref())?;
+    let Solver { name: solver, path: binary, json } = jobs.solver(p.solver.as_deref())?;
     let deck = roots.existing(&p.inp_path, &["inp"])?;
     let jobname = deck.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
     if !valid_jobname(&jobname) {
@@ -356,6 +366,7 @@ pub fn prepare_solve(roots: &Roots, jobs: &JobManager, p: CcxSolveIn) -> Result<
         jobname,
         solver,
         binary,
+        json,
         threads: p.threads.unwrap_or(4).clamp(1, cpus),
         timeout_s: p.timeout_s.unwrap_or(3600).clamp(1, 86_400),
         label: p.label.map(|l| l.chars().take(60).collect()),
@@ -370,6 +381,7 @@ pub fn solve_out(roots: &Roots, m: &Manifest, files_copied: usize, flags: Vec<St
         run_dir: roots.display(&m.run_dir),
         jobname: m.jobname.clone(),
         solver: m.solver.clone(),
+        telemetry_source: m.telemetry_source,
         threads: m.threads,
         files_copied,
         flags,
@@ -407,6 +419,8 @@ pub struct CcxJobStatusOut {
     pub label: Option<String>,
     pub jobname: String,
     pub solver: String,
+    /// json | sta_cvg (stock CalculiX, see `notes`)
+    pub telemetry_source: TelemetrySource,
     pub threads: usize,
     pub elapsed_s: f64,
     pub exit_code: Option<i32>,
@@ -426,8 +440,13 @@ pub struct CcxJobStatusOut {
     /// Result files that exist, by kind
     pub files: Map<String, Value>,
     pub tail: Option<String>,
+    /// Limits of this job's telemetry, when there are any
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub next: String,
 }
+
+pub const STOCK_NOTE: &str = "Stock CalculiX: no JSON telemetry, so per-step convergence flags, solver name, timings and mode tables are not available; progress and diagnosis use .sta/.cvg only. The CalculiX MultiSolver build (https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver) writes this telemetry with -j.";
 
 /// Build the status view. Blocking (reads the run directory).
 pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatusOut {
@@ -490,6 +509,7 @@ pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatu
         label: m.label.clone(),
         jobname: m.jobname.clone(),
         solver: m.solver.clone(),
+        telemetry_source: m.telemetry_source,
         threads: m.threads,
         elapsed_s: m.elapsed_s(),
         exit_code: m.exit_code,
@@ -501,6 +521,7 @@ pub fn job_status(roots: &Roots, m: &Manifest, tail_lines: usize) -> CcxJobStatu
         telemetry: json.map(compact_telemetry),
         files,
         tail,
+        notes: if m.telemetry_source == TelemetrySource::StaCvg { vec![STOCK_NOTE.to_string()] } else { Vec::new() },
         next: next.into(),
     }
 }
@@ -607,7 +628,7 @@ pub struct CcxJobListIn {
 
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CcxJobListOut {
-    /// Newest first. Columns: job_id, state, jobname, label, elapsed_s, run_dir_mb
+    /// Newest first. Columns: job_id, state, jobname, label, elapsed_s, run_dir_mb, telemetry_source
     pub jobs: Table,
     pub page: Page,
 }
@@ -628,13 +649,14 @@ pub fn job_list(jobs: &JobManager, p: CcxJobListIn) -> CcxJobListOut {
                 json!(m.label),
                 json!(m.elapsed_s()),
                 json!((mb * 10.0).round() / 10.0),
+                json!(m.telemetry_source),
             ]
         })
         .collect();
     let end = offset + found.len();
     let page = Page { returned: found.len(), total, truncated: found.len() < total, next_offset: (end < total).then_some(end) };
     CcxJobListOut {
-        jobs: Table { columns: ["job_id", "state", "jobname", "label", "elapsed_s", "run_dir_mb"].map(String::from).to_vec(), rows },
+        jobs: Table { columns: ["job_id", "state", "jobname", "label", "elapsed_s", "run_dir_mb", "telemetry_source"].map(String::from).to_vec(), rows },
         page,
     }
 }
@@ -667,6 +689,18 @@ mod tests {
 
         assert_eq!(run("cutback_loop_att4.cvg").unwrap().verdict, "CUTBACK_LOOP");
         assert_eq!(run("diverge_blowup").unwrap().verdict, "DIVERGED");
+    }
+
+    /// A stock-ccx job has .sta/.cvg and no .json: diagnosis must not need JSON.
+    #[test]
+    fn diagnose_works_without_json_for_a_stock_job() {
+        let base = fixtures().creatable("chatter_failed", &[]).unwrap();
+        assert!(!with_ext(&base, "json").exists());
+        let job = JobView { base, running: false, failed: false, stdout_tail: String::new(), telemetry_source: TelemetrySource::StaCvg };
+        let d = run_diagnose(&fixtures(), CcxDiagnoseIn { job_path: None, job_id: Some("x".into()), step: None, last_increments: None }, Some(job)).unwrap();
+        assert_eq!(d.verdict, "CONTACT_CHATTER");
+        assert!(!d.coverage.json && d.coverage.sta_rows > 0);
+        assert!(d.notes.iter().any(|n| n.starts_with("Stock CalculiX: no JSON telemetry")), "{:?}", d.notes);
     }
 
     #[test]
@@ -702,7 +736,7 @@ mod tests {
         std::fs::write(&fake, "").unwrap();
 
         let roots = Roots::new(vec![dir.join("root")]).unwrap();
-        let jobs = JobManager::new(roots.first(), vec![("fake".into(), fake)], Vec::new(), std::time::Duration::from_millis(100));
+        let jobs = JobManager::new(roots.first(), vec![Solver { name: "fake".into(), path: fake, json: true }], Vec::new(), std::time::Duration::from_millis(100));
         let prep = |deck: &str| prepare_solve(&roots, &jobs, CcxSolveIn { inp_path: format!("case/{}", deck), solver: None, threads: Some(1), timeout_s: None, label: None });
 
         let (local, copied, _) = prep("local.inp").unwrap();

@@ -6,7 +6,7 @@
 [![CalculiX](https://img.shields.io/badge/CalculiX-native-2E7D32.svg)](http://www.calculix.de/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Let an AI agent work on real CalculiX models.** `calculix-mcp` is a Model Context Protocol server that gives Claude, Antigravity or any MCP client direct access to your finite-element work: it reads decks with their whole `*INCLUDE` tree, checks the mesh, selects faces by geometry, runs the solver in the background, explains convergence problems, and quotes exact results with node ids from ASCII or binary `.frd` files.
+**Let an AI agent work on real CalculiX models.** `calculix-mcp` is a Model Context Protocol server that gives Claude, Antigravity or any MCP client direct access to your finite-element work: it builds geometry and meshes through CalculiX GraphiX, reads decks with their whole `*INCLUDE` tree and edits them into new files, checks the mesh, selects faces and finds contact pairs, runs the solver in the background, explains convergence problems, and quotes exact results with node ids from ASCII or binary `.frd` files.
 
 It is written in Rust, works on the decks and result files you already have, and never asks the model to estimate a number it can compute. The repository also includes [`cgx-top`](#cgx-top-results-in-your-terminal), a small terminal tool for checking results by hand.
 
@@ -15,7 +15,7 @@ flowchart LR
     C["AI client<br/>Claude Code · Antigravity"] -- "MCP (stdio)" --> S["calculix-mcp<br/>this repository"]
     S --> F["Your models<br/>.inp decks · meshes · .frd results"]
     S --> M["CalculiX MultiSolver<br/>solve · JSON telemetry"]
-    S -.-> G["CalculiX GraphiX GLFW<br/>meshing · contour images (planned)"]
+    S --> G["CalculiX GraphiX GLFW<br/>geometry · meshing<br/>(contour images planned)"]
 ```
 
 ## Part of a CalculiX toolchain
@@ -26,7 +26,7 @@ flowchart LR
 |---|---|
 | **calculix-mcp-rs** (this repository) | The MCP server and the Rust library behind it: deck inspection, mesh checks and face selection, solver jobs, convergence diagnosis, result queries |
 | [**CalculiX MultiSolver**](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver) | A multi-platform edition of the CalculiX solver (CrunchiX) with selectable sparse solvers (MUMPS, Apple Accelerate, PARDISO, SPOOLES) and JSON run telemetry, which `calculix-mcp` reads to report each solve |
-| [**CalculiX GraphiX GLFW**](https://github.com/carlomontec/CalculiX-GraphiX-GLFW) | A multi-platform edition of the CalculiX pre- and post-processor (GraphiX) on GLFW, with a command channel that will let `calculix-mcp` mesh geometry and render contour plots |
+| [**CalculiX GraphiX GLFW**](https://github.com/carlomontec/CalculiX-GraphiX-GLFW) | A multi-platform edition of the CalculiX pre- and post-processor (GraphiX) on GLFW, whose batch mode `calculix-mcp` runs to build geometry and meshes, and whose command channel will let it render contour plots |
 
 ## What a session looks like
 
@@ -46,7 +46,10 @@ Other things you can ask:
 |---|---|
 | "Show me the frequency step and the boundary conditions of this deck." | `inp_cards` |
 | "Any free nodes or disconnected parts? What is the mass per material?" | `mesh_check` |
+| "Mesh a 100 × 20 × 10 block with 20-node hexes and check it." | `cgx_help`, `cgx_run_batch`, `mesh_check` |
 | "Save the upward-facing faces above z = 40 as a surface called TOP." | `mesh_select` |
+| "Which parts touch each other? Write the contact surfaces." | `mesh_contact_pairs` |
+| "Request 12 modes instead of 5 and show me the diff." | `inp_edit` |
 | "Solve it with MUMPS on 8 threads and tell me when it is done." | `ccx_solve`, `ccx_job_status` |
 | "My contact job keeps cutting back. Why?" | `ccx_diagnose` |
 | "Peak von Mises on set BLADE_ROOT in every step, and the five worst nodes with coordinates." | `frd_query_set` |
@@ -58,6 +61,7 @@ Full transcripts with the raw tool output are in [`crates/calculix-mcp/README.md
 - Works on existing decks: the whole `*INCLUDE` tree, cyclic symmetry, modal results with mode number and nodal diameter.
 - Reads large ASCII and binary `.frd` files lazily; a 409 MB file is summarised in well under a second.
 - Solves on a private copy of the deck and always cleans up its processes.
+- Builds geometry and meshes through CalculiX GraphiX, finds contact pairs, and edits decks only by writing new files.
 - Returns exact values with node ids, plus notes when a number needs context.
 
 ## Install and connect
@@ -70,16 +74,16 @@ cd calculix-mcp-rs
 cargo build --release -p calculix-mcp
 ```
 
-The server is `target/release/calculix-mcp`. You need a Rust toolchain, and for solving, a build of [CalculiX MultiSolver](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver). Every other tool works without a solver.
+The server is `target/release/calculix-mcp`. You need a Rust toolchain, and for solving, either stock CalculiX (`ccx`, for example from your distribution's package) or a build of [CalculiX MultiSolver](https://github.com/carlomontec/CalculiX-CrunchiX-MultiSolver). MultiSolver is recommended: it writes JSON telemetry (per-step convergence flags, solver name, timings, mode tables) that makes job status and diagnosis richer. With stock CalculiX, progress and diagnosis use the `.sta` and `.cvg` files only. Every other tool works without a solver.
 
 ### 2. Connect your AI client
 
-Two flags matter: `--root` is the folder the server may read and write (your cases), and `--ccx NAME=PATH` registers a solver build. Repeat `--ccx` to offer several (for example `accelerate`, `spooles`, `mumps`); the first is the default. Use absolute paths.
+Two flags matter: `--root` is the folder with your models (`.inp` decks, their include files and `.frd` results, subfolders included); the server may read everything under it and only ever adds new files there, and `--ccx NAME=PATH` registers a solver binary, stock `ccx` or a MultiSolver build. At startup the server checks which one it is and logs it to stderr; a MultiSolver binary is run as `-j <job>` and a stock one as `-i <job>`. Repeat `--ccx` to offer several (for example `accelerate`, `spooles`, `mumps`, or `ccx=/usr/bin/ccx`); the first is the default. Add `--cgx PATH` (a CalculiX GraphiX binary, for example the GLFW edition) to enable geometry and meshing. Use absolute paths.
 
 **Claude Code**: register once from a terminal:
 
 ```bash
-claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/path/to/cases --ccx mumps=/abs/path/to/CalculiX
+claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/path/to/my-models --ccx mumps=/abs/path/to/CalculiX
 ```
 
 or put this in a `.mcp.json` file at the root of your project, to share the setup with the project:
@@ -90,7 +94,7 @@ or put this in a `.mcp.json` file at the root of your project, to share the setu
     "calculix": {
       "type": "stdio",
       "command": "/abs/path/to/calculix-mcp",
-      "args": ["--root", "/abs/path/to/cases", "--ccx", "mumps=/abs/path/to/CalculiX"]
+      "args": ["--root", "/abs/path/to/my-models", "--ccx", "mumps=/abs/path/to/CalculiX"]
     }
   }
 }
@@ -118,7 +122,7 @@ The server never edits your deck: selections go to new include files, and solves
 
 ### Platforms
 
-The configuration is the same JSON on every operating system; only file locations and path syntax differ (on Windows, write paths in JSON as `C:/cases` or `C:\\cases`). The server is developed and tested on macOS. Linux uses the same mechanisms and is expected to work but has not been tested yet. On Windows it is untested, and stopping a solver ends only its direct process, not the processes it started.
+On Debian and Ubuntu, stock CalculiX is the `calculix-ccx` package (binary `/usr/bin/ccx`, so `--ccx ccx=/usr/bin/ccx`). The configuration is the same JSON on every operating system; only file locations and path syntax differ (on Windows, write paths in JSON as `C:/cases` or `C:\\cases`). The server is developed and tested on macOS. Linux uses the same mechanisms and is expected to work but has not been tested yet. On Windows it is untested, and stopping a solver ends only its direct process, not the processes it started.
 
 All flags are documented in the [server README](crates/calculix-mcp/README.md#run-and-flags).
 
@@ -129,8 +133,12 @@ All flags are documented in the [server README](crates/calculix-mcp/README.md#ru
 | Decks | `inp_inspect` | Summary of a deck across its `*INCLUDE` tree: flags, keyword census, step plan, includes, sets, materials |
 | | `inp_cards` | Specific keyword cards with file, line and data lines, without loading the whole deck |
 | | `inp_consolidate` | Flatten a multi-file deck into one file |
+| | `inp_edit` | Located edits (parameters, data lines, cards, steps) written to new files, with a diff and a re-check |
+| Geometry | `cgx_run_batch` | Run a CalculiX GraphiX script headlessly to build geometry and meshes; returns the files and a mesh summary |
+| | `cgx_help` | CalculiX GraphiX command reference with verified examples |
 | Mesh | `mesh_check` | Parts, free nodes, inverted elements, aspect ratios, volume, mass and centre of gravity, undefined or empty sets |
 | | `mesh_select` | Select exterior faces by geometry and save them as a `*SURFACE` or `*NSET` include file |
+| | `mesh_contact_pairs` | Find faces of different parts that face each other within a gap; save slave and master surfaces and a contact-card template |
 | Solve | `ccx_solve` | Start a background solve on a private copy of the deck |
 | | `ccx_job_status` | State, progress, memory, convergence verdict and result files; waits for a change instead of polling |
 | | `ccx_job_cancel` | Stop a job and every process it started |
@@ -226,12 +234,15 @@ Both tools are built on `cgx-core`, which can also be used as a library: lazy `.
 - [x] Deck inspection, mesh checks and face selection
 - [x] Background solver jobs with cleanup, quota and crash recovery
 - [x] Convergence diagnosis from `.sta` and `.cvg`
+- [x] Solving with stock CalculiX and with CalculiX MultiSolver
 - [x] Exact result queries on large ASCII and binary `.frd` files, including cyclic-symmetry modes
-- [ ] Contact pair detection between parts
-- [ ] Located, reviewable deck edits written to a new file with a diff
-- [ ] Geometry and meshing through CalculiX GraphiX batch scripts
+- [x] Contact pair detection between parts
+- [x] Located, reviewable deck edits written to new files with a diff
+- [x] Geometry and meshing through CalculiX GraphiX batch scripts
+- [x] CI on Linux, macOS and Windows, with an end-to-end solve
 - [ ] Contour images rendered by CalculiX GraphiX
-- [ ] Solving with stock CalculiX, Windows process handling, CI
+- [ ] `cgx-top --watch`: live view of a running solve
+- [ ] Windows process-tree handling for cancelled solves
 
 Limitations and design notes: [server README](crates/calculix-mcp/README.md#limitations), [`docs/`](docs).
 

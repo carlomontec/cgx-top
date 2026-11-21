@@ -55,7 +55,7 @@ jobs:
   #    real solve through the MCP server over stdio
   # ============================================================================
   e2e:
-    name: End to end with CalculiX MultiSolver (Linux, MUMPS)
+    name: End to end with CalculiX MultiSolver and stock ccx (Linux)
     runs-on: ubuntu-24.04
     needs: test
 
@@ -105,3 +105,13 @@ jobs:
         run: |
           export OMP_NUM_THREADS=1
           python3 crates/calculix-mcp/tests/smoke/drive.py "mumps=$GITHUB_WORKSPACE/multisolver/build_mumps/CalculiX"
+
+      - name: Install stock CalculiX
+        run: |
+          sudo apt-get install -y calculix-ccx
+          /usr/bin/ccx -v || true
+
+      - name: Solve, diagnose and query with stock CalculiX
+        run: |
+          export OMP_NUM_THREADS=1
+          python3 crates/calculix-mcp/tests/smoke/drive.py "ccx=/usr/bin/ccx"

@@ -148,3 +148,14 @@ Migrating the CLI/TUI to `FrdIndex`, fixing `increment_number`/`description`, re
 - README written (`crates/calculix-mcp/README.md`); it predates the two mesh tools.
 - Note on the record: the "last task" prompt asking for `ccx_solve`/`ccx_job_status`/`ccx_job_cancel` was received a second time at the end of this session. That work was already complete and committed in 638b141, so the session closed with review, handoff update and commit instead.
 - Continue from `docs/HANDOFF.md`: status table first, then tasks 10 to 15 and the open older tasks.
+
+### 2026-11-21 — paused with uncommitted work (resume here)
+
+All of the following is merged in the working tree of `main`, NOT committed or pushed. `cargo test --workspace --locked`: 199 passed, 0 failed; `CGX_BIN=/Users/carlo/code/CalculiX/cgx/bin/cgx_glfw cargo test -p calculix-mcp cgx_real -- --ignored`: 4 passed. The server has 17 tools.
+- Stock ccx support (`-i job`, judged by exit code and `*ERROR`; `telemetry_source`; honest note recommending MultiSolver JSON). CI e2e step installs Ubuntu `calculix-ccx` — package name unverified until CI runs.
+- `inp_edit` (cgx-core `parser/inp_edit.rs`, `edit_tools.rs`): located edits to new files, diff and re-check.
+- `mesh_contact_pairs` (cgx-core `mesh_contact.rs`, `contact_tools.rs`): 100 % slave-face coverage on four ccx contact decks.
+- `cgx_run_batch` + `cgx_help` (`cgx_tools.rs`, `resources/cgx_cheatsheet.md`, `--cgx PATH`): headless CGX geometry/meshing with a command screen; process helpers shared in `jobs.rs`.
+
+To resume: review `git diff`, update both READMEs (tool table and roadmap for the four new tools, `--cgx` flag), commit, push, check CI (especially the stock-ccx step), then `/mcp` reconnect to use the new binary (`cargo build --release -p calculix-mcp`). One unverified ad hoc check: driving `cgx_run_batch` with a script cut out of `cgx_help` text failed in a quick hand-written test; the real-binary integration tests pass, so this is probably the test script, but look at it first.
+- Resumed 2026-11-21: the `cgx_run_batch` loose end was the hand-written test script (it glued two examples and a prose line together). Run correctly, the cheatsheet sweep example gives 40 C3D20, `mesh_check` OK with volume 20000, `mesh_select` +z gives 20 faces of area 2000, and `sys` is rejected. Both READMEs now document the four new tools and `--cgx`.

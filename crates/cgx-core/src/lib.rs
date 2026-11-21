@@ -6,6 +6,7 @@ pub mod parser;
 pub mod telemetry;
 pub mod mesh_faces;
 pub mod mesh_check;
+pub mod mesh_contact;
 
 pub use model::*;
 pub use invariants::*;
@@ -16,8 +17,10 @@ pub use parser::{
 };
 
 pub use parser::inp_cards::*;
+pub use parser::inp_edit::*;
 pub use mesh_faces::*;
 pub use mesh_check::*;
+pub use mesh_contact::*;
 pub use parser::inp_mesh::*;
 
 use thiserror::Error;

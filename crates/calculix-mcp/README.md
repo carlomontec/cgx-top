@@ -10,6 +10,7 @@ Most CalculiX wrappers drive a small generated model: write a deck, run it, prin
 - **Cyclic symmetry.** Decks with `*CYCLIC SYMMETRY MODEL` are recognised, and result steps carry the mode number and nodal diameter (see the compressor rotor example below).
 - **Large and binary result files.** `.frd` files are indexed lazily, in ASCII or binary form, and only the requested dataset is read. A 409 MB result file is summarised without loading it into memory.
 - **Mesh checks and selections.** `mesh_check` reports parts, free nodes, inverted elements, aspect ratios, volume and mass of a deck's solid mesh. `mesh_select` picks exterior faces by direction, plane, box, cylinder, nearness or connected patch and can write them as a `*SURFACE` or `*NSET` include file. The deck itself is never edited.
+- **Geometry, contact and deck edits.** `cgx_run_batch` builds geometry and meshes by running CalculiX GraphiX scripts headlessly; `mesh_contact_pairs` finds faces of different parts that face each other and writes the surfaces; `inp_edit` changes a deck by addressing its cards and writes the result to new files with a diff.
 - **Convergence diagnosis.** `ccx_diagnose` reads `<job>.sta` and `<job>.cvg` (and `<job>.json` if present) and classifies the run as linear, smooth, slow, contact chattering, cutback loop or divergence, with the evidence, the last increments and suggested next steps.
 - **Exact values with node ids.** `frd_query_set` returns von Mises, principal, Tresca, hydrostatic or displacement extrema on a node or element set, per step, with the responsible node ids and coordinates. The model is not asked to estimate these.
 
@@ -24,18 +25,30 @@ The binary is `target/release/calculix-mcp`. It needs a Rust toolchain (edition 
 ## Run and flags
 
 ```bash
-calculix-mcp --root /abs/case/dir --ccx ccx=/abs/path/to/CalculiX
+calculix-mcp --root /abs/path/to/my-models --ccx ccx=/abs/path/to/CalculiX
 ```
 
-`--ccx` must point to a CalculiX **MultiSolver** build that supports `-j` JSON telemetry (it writes `<job>.json`). Stock CalculiX is not supported: the server starts with a warning if the binary does not mention `CCX_JSON`, and a solve that exits 0 without writing `<job>.json` is marked failed with `SOLVER_NO_JSON`.
+`--ccx` accepts stock CalculiX (`ccx`, for example 2.21 or 2.22 from a distribution package) and CalculiX **MultiSolver** builds. MultiSolver is recommended: its `-j` JSON telemetry (`<job>.json`) gives richer job status and diagnosis (per-step convergence flags, solver name, timings, mode tables).
 
-Pass `--ccx NAME=PATH` multiple times to expose several MultiSolver builds (for example `--ccx accelerate=... --ccx spooles=... --ccx mumps=...`); the first is used when `solver` is omitted. `ccx_solve` invokes the binary with `-j <jobname>` to enable MultiSolver JSON telemetry.
+At startup each binary is classified as `json` (MultiSolver) or `stock`: a binary that contains the string `CCX_JSON` is taken to be MultiSolver. A wrapper script around a MultiSolver build does not contain it and is treated as stock. The result is logged to stderr, one line per solver, and reported as `telemetry_source` (`json` or `sta_cvg`) by `ccx_solve`, `ccx_job_status` and `ccx_job_list`.
+
+Pass `--ccx NAME=PATH` multiple times to expose several solvers (for example `--ccx accelerate=... --ccx mumps=... --ccx stock=/usr/bin/ccx`); the first is used when `solver` is omitted. `ccx_solve` runs a MultiSolver binary as `<binary> -j <jobname>` and a stock one as `<binary> -i <jobname>`.
+
+How a solve is judged:
+
+| Solver | Succeeded | Failed |
+|---|---|---|
+| `json` | exit 0 and `<job>.json` with `meta.success` not false | non-zero exit or signal; exit 0 with no `<job>.json` (`SOLVER_NO_JSON`); `meta.success = false` (`SOLVER_REPORTED`) |
+| `stock` | exit 0 and no line containing `*ERROR` in `stdout.log` or `stderr.log` | non-zero exit or signal; exit 0 with an `*ERROR` line (`SOLVER_REPORTED: <first error line>`) |
+
+With a stock solver, `ccx_job_status` has no `telemetry` field and carries a `notes` entry saying so. Progress, verdict and `ccx_diagnose` come from `<job>.sta` and `<job>.cvg`.
 
 | Flag | Meaning |
 |---|---|
-| `--root DIR` | Directory the server may read and write. Repeatable. Default: the current directory. Job run directories are created under the first root. |
-| `--ccx NAME=PATH` | MultiSolver binary, run as `CalculiX -j <jobname>`. Repeatable; the first is the default. Without it, `ccx_solve` returns `TOOL_DISABLED`; all other tools still work. |
+| `--root DIR` | Folder with your models (`.inp` decks, include files, `.frd` results; subfolders included). The server may read everything under it. Repeatable. Default: the current directory. Job run directories are created under the first root. |
+| `--ccx NAME=PATH` | Solver binary: stock `ccx` (run as `-i <jobname>`) or CalculiX MultiSolver (run as `-j <jobname>`). Repeatable; the first is the default. Without it, `ccx_solve` returns `TOOL_DISABLED`; all other tools still work. |
 | `--env-passthrough NAME` | Environment variable to pass to the solver, for example `DYLD_LIBRARY_PATH`. Repeatable. |
+| `--cgx PATH` | CalculiX GraphiX binary (for example the GLFW edition), run headlessly as `cgx -bg`. Without it, `cgx_run_batch` returns `TOOL_DISABLED`; all other tools still work. |
 | `--max-run-gb GIB` | Size a job's run directory may reach before the job is killed with `DISK_QUOTA`. Default 50. |
 
 stdout carries JSON-RPC only; diagnostics go to stderr. The server stops on stdin EOF, SIGINT or SIGTERM, and kills any running solver first.
@@ -45,7 +58,7 @@ stdout carries JSON-RPC only; diagnostics go to stderr. The server stops on stdi
 Claude Code:
 
 ```bash
-claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/case/dir --ccx ccx=/abs/path/to/CalculiX
+claude mcp add calculix -- /abs/path/to/calculix-mcp --root /abs/path/to/my-models --ccx ccx=/abs/path/to/CalculiX
 ```
 
 Antigravity (`~/.gemini/config/mcp_config.json`) or Claude Desktop (`claude_desktop_config.json`):
@@ -56,7 +69,7 @@ Antigravity (`~/.gemini/config/mcp_config.json`) or Claude Desktop (`claude_desk
     "calculix": {
       "command": "/abs/path/to/calculix-mcp",
       "args": [
-        "--root", "/abs/case/dir",
+        "--root", "/abs/path/to/my-models",
         "--ccx", "accelerate=/abs/path/to/build_accelerate/CalculiX",
         "--ccx", "spooles=/abs/path/to/build_spooles/CalculiX",
         "--ccx", "mumps=/abs/path/to/build_mumps/CalculiX"
@@ -75,8 +88,12 @@ Use absolute paths. Other MCP clients take the same command and arguments.
 | `inp_inspect` | Summarise a CalculiX `.inp` deck across its `*INCLUDE` tree: flags, keyword census, step plan, includes (missing ones first), sets, materials. Call first on any deck. |
 | `inp_cards` | List keyword cards of a deck (for example `CONTACT PAIR`, `BOUNDARY`, `STATIC`) across its `*INCLUDE` tree, with file:line and the first data lines. |
 | `inp_consolidate` | Flatten a multi-file deck into one `.inp` file on disk. Returns statistics, never deck text. |
+| `inp_edit` | Edit a deck by addressing keyword cards (set or remove a parameter, replace data lines, insert or delete a card, append a step). Writes the result to new files and returns a diff and a re-check; the original deck and its includes are never modified. `dry_run` previews. |
+| `cgx_run_batch` | Run a CalculiX GraphiX (`.fbd`) script headlessly to build geometry and meshes, in a private run directory. Returns the files produced and a summary of each mesh. The script is screened for shell and path-escaping commands; this is a mitigation, not a sandbox. |
+| `cgx_help` | CalculiX GraphiX command reference with verified examples for geometry, meshing, sets and export. |
 | `mesh_check` | Check a deck's mesh before solving: disconnected parts, free nodes, inverted elements, worst aspect ratios, volume, mass and centre of gravity per material, undefined or empty sets. Call before a long solve. |
 | `mesh_select` | Select faces of a mesh by geometry (direction, plane, box, cylinder, near a point, connected patch from a seed) and optionally save them as a `*SURFACE` or `*NSET` include file. Returns count, area and bounding box so the selection can be checked before use. Never edits the deck. |
+| `mesh_contact_pairs` | Find faces of different parts that face each other within a gap (contact candidates), with gaps, areas and a suggested slave/master side; optionally save both surfaces and a contact-card template. Never edits the deck. |
 | `ccx_solve` | Start a solve in the background on a private copy of the deck. The original directory is never written to. Returns a `job_id` immediately. |
 | `ccx_job_status` | State, progress, memory, convergence verdict and result files of a job. `wait_s` blocks until the state changes instead of polling. |
 | `ccx_job_cancel` | Stop a queued or running job and remove all of its processes. Safe to call on a finished job. |
@@ -90,7 +107,7 @@ Large listings are paged with `offset` and `limit`. Errors are structured: they 
 
 ## Example 1: solve a cube and read the result
 
-This transcript comes from `crates/calculix-mcp/tests/smoke/drive.py`, which solves a one-element cube (`tests/smoke/cube.inp`, 8 nodes, 100 N on the top face) with any MultiSolver build of CalculiX (the sample output below used a MUMPS build). Run from the workspace root:
+This transcript comes from `crates/calculix-mcp/tests/smoke/drive.py`, which solves a one-element cube (`tests/smoke/cube.inp`, 8 nodes, 100 N on the top face) with stock CalculiX or any MultiSolver build (the sample output below used a MultiSolver MUMPS build). Run from the workspace root:
 
 ```bash
 cargo build -p calculix-mcp
@@ -305,7 +322,7 @@ The lazy figure for resident memory is mostly memory-mapped file pages, which th
 
 - **Root confinement.** Every path argument is resolved against `--root` and must stay inside a root. Paths that escape through `..` or symlinks are rejected.
 - **Isolated run directory.** `ccx_solve` copies the deck and every file it includes or references into `<root>/.calculix-mcp/runs/<job_id>/` and runs the solver there. The original directory is not written to. Files outside the deck's directory are rejected with a hint to use `inp_consolidate`. Run directories are never deleted by the server.
-- **No shell.** The solver is started with an explicit argument vector (`<binary> -j <jobname>`); no argument is passed through a shell, and the solver binary can only be one of those named with `--ccx`.
+- **No shell.** The solver is started with an explicit argument vector (`<binary> -j <jobname>`, or `-i <jobname>` for stock ccx); no argument is passed through a shell, and the solver binary can only be one of those named with `--ccx`.
 - **Cleared environment.** The solver gets `PATH`, a private `HOME` and `TMPDIR`, `LANG` and `LC_ALL` set to `C`, the thread-count variables, and any names given with `--env-passthrough`. Nothing else is inherited.
 - **Process-group cleanup.** Each solver leads its own process group. Cancel, timeout and server shutdown send SIGTERM to the group, wait 5 seconds, send SIGKILL, reap the child, and send SIGKILL to the group once more. After a server crash, the next start marks orphaned jobs `LOST` and kills the old process only if its recorded start time still matches.
 - **One job at a time.** Up to 8 further jobs wait in a queue.
@@ -313,6 +330,7 @@ The lazy figure for resident memory is mostly memory-mapped file pages, which th
 
 ## Limitations
 
+- Stock CalculiX gives less telemetry than MultiSolver: no per-step convergence flags, solver name, timings or mode tables, so `ccx_job_status` and `ccx_diagnose` rely on `.sta` and `.cvg`, and a stock solve is judged by exit code and `*ERROR` lines. Whether a binary is MultiSolver is decided by searching it for `CCX_JSON`.
 - Process-group cleanup uses Unix signals. On Windows only the direct child process is killed.
 - The convergence thresholds are heuristics. They were calibrated on synthetic cases and on three real contact runs that had no cutbacks or divergence. Treat warnings as leads, not as verdicts.
 - Modal displacements and stresses in `.frd` files are normalised mode shapes. Their size is not a physical magnitude.
@@ -322,7 +340,10 @@ The lazy figure for resident memory is mostly memory-mapped file pages, which th
 - `mesh_check` computes volume, mass and centre of gravity from corner nodes only, so the values for curved quadratic elements are approximate: on a coarse 16-segment C3D20 ring the volume comes out 2.55 % low. The element volumes are cross-checked in the tests against a surface integral over the exterior faces. Values are in deck units; no unit conversion is applied.
 - `mesh_select` works on the exterior faces of solid elements. Shell and beam elements are ignored.
 - `mesh_select` writes selections to include files. The deck itself is never edited, so you add the `*INCLUDE` line the tool returns.
-- No geometry creation, meshing or deck editing, and no rendering: the server returns numbers and tables, not images.
+- No rendering yet: the server returns numbers, tables and files, not images.
+- `cgx_run_batch` runs scripts the agent writes. Scripts are screened for `sys`, external programs and paths outside the run directory, but this is a mitigation, not a sandbox.
+- `mesh_contact_pairs` works on exterior faces of solid elements; shell faces and contact with the rotated neighbour of a cyclic sector are not detected. Its contact-card template must be reviewed before use.
+- `inp_edit` refuses to edit a card inside an include file that the deck includes more than once; consolidate the deck first.
 
 ## Licence
 
