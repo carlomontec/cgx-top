@@ -148,6 +148,8 @@ All flags are documented in the [server README](crates/calculix-mcp/README.md#ru
 | | `frd_sets` | Node and element sets available for queries |
 | | `frd_query_set` | Exact stress invariants or displacement extrema on one set, per step, with the most loaded nodes |
 
+A plain-language guide to every tool, with an example prompt and a real result for each, is in [docs/TOOLS.md](docs/TOOLS.md).
+
 ## Built to be trusted
 
 - **Confined.** Every path must resolve inside `--root`; `..` and symlink escapes are rejected.
